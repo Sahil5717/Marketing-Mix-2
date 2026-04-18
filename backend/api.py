@@ -893,6 +893,44 @@ def get_channel_deep_dive(channel: str):
                           "Inconclusive" if raw in ("Low", "Inconclusive") else
                           "Directional")
 
+    # Curve data fix: the MMM engine samples curve_points at a monthly-spend
+    # basis (x_max = max(monthly_spend) * 1.8). The optimizer's current_spend
+    # and optimal_spend are ANNUALIZED (×12). Result: the dots plot at
+    # ~$10M but the curve ends at ~$5M, making them look disconnected
+    # and the curve look "clipped." Re-sample the curve here to cover
+    # enough range for the dots to sit ON the curve.
+    if curve_data and optimization and "params" in curve_data:
+        import numpy as np
+        max_dot_spend = max(optimization["current_spend"],
+                            optimization["optimal_spend"])
+        # Extend to 1.3x beyond the farthest dot so there's headroom
+        # past the optimal marker without the curve dying at the dot.
+        target_xmax = max_dot_spend * 1.3
+        existing_xmax = curve_data["curve_points"][-1]["spend"] if curve_data["curve_points"] else 0
+
+        if target_xmax > existing_xmax * 1.05:  # only resample if meaningfully different
+            params = curve_data["params"]
+            model = curve_data.get("model", "power_law")
+            a = params.get("a", 0)
+            b = params.get("b", 0.5)
+            if model == "power_law":
+                # power_law: revenue = a * spend^b
+                curve_data = dict(curve_data)  # don't mutate cache
+                curve_data["curve_points"] = [
+                    {"spend": round(float(s), 0),
+                     "revenue": round(float(a * (s ** b)) if s > 0 else 0, 0)}
+                    for s in np.linspace(0, target_xmax, 60)
+                ]
+            elif model == "hill":
+                K = params.get("K", 1)
+                # hill: revenue = a * (spend^b / (K^b + spend^b))
+                curve_data = dict(curve_data)
+                curve_data["curve_points"] = [
+                    {"spend": round(float(s), 0),
+                     "revenue": round(float(a * ((s**b) / ((K**b) + (s**b)))) if s > 0 else 0, 0)}
+                    for s in np.linspace(0, target_xmax, 60)
+                ]
+
     return _j({
         "channel": channel,
         "channel_display": channel.replace("_", " ").title(),
@@ -1078,6 +1116,69 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
         engagement_id=engagement_id,
         view=view,
     )
+
+    # Enrich KPIs with QoQ deltas so the UI can show "▲ 0.4 vs last
+    # quarter" under the Portfolio ROAS number (and equivalent for
+    # the other KPI cards). The QoQ data was already computed during
+    # run-analysis; we just surface the relevant slices here.
+    qoq_state = _state.get("qoq_yoy") or {}
+    qoq_portfolio = qoq_state.get("qoq") or {}
+    pillars_state = _state.get("pillars") or {}
+
+    kpis = result.get("kpis") or {}
+
+    # Portfolio ROAS: QoQ change in roas
+    if isinstance(kpis.get("portfolio_roas"), dict) and qoq_portfolio.get("roas"):
+        roas_qoq = qoq_portfolio["roas"]
+        pct = roas_qoq.get("change_pct", 0)
+        direction = roas_qoq.get("direction", "flat")
+        if direction == "up":
+            kpis["portfolio_roas"]["delta_text"] = f"{abs(pct):.1f}% vs last quarter"
+            kpis["portfolio_roas"]["delta_direction"] = "up"
+        elif direction == "down":
+            kpis["portfolio_roas"]["delta_text"] = f"{abs(pct):.1f}% vs last quarter"
+            kpis["portfolio_roas"]["delta_direction"] = "down"
+        else:
+            kpis["portfolio_roas"]["delta_text"] = "Flat vs last quarter"
+            kpis["portfolio_roas"]["delta_direction"] = "neutral"
+
+    # Value at Risk: no true QoQ since pillars are snapshot. Instead
+    # express as "% of attributable revenue" — the mockup shows
+    # "13% of attributable revenue" as the context for this KPI.
+    if isinstance(kpis.get("value_at_risk"), dict):
+        risk = pillars_state.get("total_value_at_risk", 0)
+        # Total revenue from the reporting data
+        try:
+            total_rev = float(df["revenue"].sum())
+            pct_of_rev = (risk / total_rev * 100) if total_rev > 0 else 0
+            kpis["value_at_risk"]["delta_text"] = "Recoverable via reallocation"
+            kpis["value_at_risk"]["delta_direction"] = "down"
+            kpis["value_at_risk"]["pct_of_revenue_display"] = f"{pct_of_rev:.1f}% of attributable revenue"
+        except Exception:
+            pass
+
+    # Plan Confidence: surface model R² as the context (mockup shows
+    # "Model R² = 0.87 · MAPE 6.2%" under the confidence KPI).
+    if isinstance(kpis.get("plan_confidence"), dict):
+        curves = _state.get("curves") or {}
+        # Average R² across channels with high-confidence fits
+        r2s = []
+        mapes = []
+        for ch, cv in curves.items():
+            if isinstance(cv, dict) and cv.get("diagnostics"):
+                d = cv["diagnostics"]
+                if d.get("r_squared") is not None:
+                    r2s.append(d["r_squared"])
+                if d.get("mape") is not None:
+                    mapes.append(d["mape"])
+        if r2s:
+            avg_r2 = sum(r2s) / len(r2s)
+            kpis["plan_confidence"]["r2_display"] = f"R² = {avg_r2:.2f}"
+            if mapes:
+                avg_mape = sum(mapes) / len(mapes)
+                kpis["plan_confidence"]["mape_display"] = f"MAPE {avg_mape:.1f}%"
+
+    result["kpis"] = kpis
     return _j(result)
 
 

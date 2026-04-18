@@ -112,16 +112,19 @@ export function Diagnosis({
               label={varKpi.label}
               value={varKpi.display.replace(/^\$|M$/g, "")}
               unit={varKpi.display.endsWith("M") ? "M" : ""}
-              context={varKpi.pct_of_revenue ? `${varKpi.pct_of_revenue}% of attributable revenue` : undefined}
-              deltaText={varKpi.tone === "warning" ? "Recoverable via reallocation" : undefined}
-              deltaDirection="down"
+              context={varKpi.pct_of_revenue_display ||
+                       (varKpi.pct_of_revenue ? `${varKpi.pct_of_revenue}% of attributable revenue` : undefined)}
+              deltaText={varKpi.delta_text || (varKpi.tone === "warning" ? "Recoverable via reallocation" : undefined)}
+              deltaDirection={varKpi.delta_direction || "down"}
             />
           )}
           {confKpi && (
             <KpiHero
               label={confKpi.label}
               value={confKpi.display}
-              context={confKpi.r_squared ? `Model R² = ${confKpi.r_squared}` : "Based on fit quality of underlying models"}
+              context={confKpi.r2_display
+                ? `${confKpi.r2_display}${confKpi.mape_display ? ` · ${confKpi.mape_display}` : ""}`
+                : "Based on fit quality of underlying models"}
               confidence={confKpi.display?.toLowerCase()}
             />
           )}

@@ -99,6 +99,13 @@ const HeaderBar = styled.header`
   -webkit-backdrop-filter: blur(10px);
   border-bottom: 1px solid ${t.color.borderFaint};
   height: ${t.layout.headerHeight};
+
+  /* Below 1280px the editor view's chrome overflows one row.
+     Drop the fixed height and let Inner wrap to two rows. */
+  @media (max-width: 1279px) {
+    height: auto;
+    min-height: ${t.layout.headerHeight};
+  }
 `;
 
 const Inner = styled.div`
@@ -110,9 +117,22 @@ const Inner = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: ${t.space[6]};
+  min-width: 0;
+
+  /* Wrap to a second row on narrower viewports — BrandNav on top,
+     MetaGroup on the second row. Cleaner than ellipsis-hiding any
+     of the meta info. */
+  @media (max-width: 1279px) {
+    flex-wrap: wrap;
+    height: auto;
+    padding-top: ${t.space[2]};
+    padding-bottom: ${t.space[2]};
+    row-gap: ${t.space[2]};
+  }
 
   @media (max-width: ${t.layout.bp.wide}) {
-    padding: 0 ${t.layout.pad.narrow};
+    padding-left: ${t.layout.pad.narrow};
+    padding-right: ${t.layout.pad.narrow};
   }
 `;
 

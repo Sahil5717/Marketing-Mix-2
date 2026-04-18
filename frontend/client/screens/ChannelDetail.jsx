@@ -381,7 +381,11 @@ function SaturationChart({ curve, optimization }) {
             />
           )}
 
-          {/* Markers — the terracotta and green dots */}
+          {/* Markers — the terracotta and green dots.
+              Each dot carries an inline label above it showing the
+              spend → revenue pair so the user reads the values
+              without needing to hover. Position depends on which
+              side of the chart the dot sits on so labels don't clip. */}
           {currentM != null && currentRev != null && (
             <ReferenceDot
               x={currentM}
@@ -391,6 +395,15 @@ function SaturationChart({ curve, optimization }) {
               stroke={t.color.surface}
               strokeWidth={2}
               ifOverflow="extendDomain"
+              label={{
+                value: `Current $${currentM.toFixed(1)}M → $${currentRev.toFixed(1)}M`,
+                position: currentM < maxSpend * 0.5 ? "right" : "left",
+                offset: 12,
+                fill: t.color.accent,
+                fontSize: 11,
+                fontWeight: 600,
+                fontFamily: t.font.body,
+              }}
             />
           )}
           {optimalM != null && optimalRev != null && (
@@ -402,6 +415,15 @@ function SaturationChart({ curve, optimization }) {
               stroke={t.color.surface}
               strokeWidth={2}
               ifOverflow="extendDomain"
+              label={{
+                value: `Optimal $${optimalM.toFixed(1)}M → $${optimalRev.toFixed(1)}M`,
+                position: optimalM < maxSpend * 0.5 ? "right" : "left",
+                offset: 12,
+                fill: t.color.positive,
+                fontSize: 11,
+                fontWeight: 600,
+                fontFamily: t.font.body,
+              }}
             />
           )}
         </AreaChart>
