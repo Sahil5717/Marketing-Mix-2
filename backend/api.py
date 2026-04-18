@@ -720,13 +720,94 @@ def get_full_state():
     })
 
 
+@app.get("/api/channels")
+def list_channels():
+    """
+    List all channels present in the campaign data with their current
+    spend and (if available) the optimizer's recommended action.
+
+    Powers the Channel Detail picker dropdown and the default-channel
+    resolution: when the user clicks "Channels" in the nav without a
+    specific channel, the backend picks the highest-priority channel
+    (largest absolute change from the optimizer).
+    """
+    if _state["campaign_data"] is None:
+        raise HTTPException(400, "No data loaded")
+    df = _state["campaign_data"]
+
+    # Build per-channel summary
+    by_ch = df.groupby("channel").agg(
+        spend=("spend", "sum"),
+        revenue=("revenue", "sum"),
+    ).reset_index()
+    by_ch["roas"] = by_ch["revenue"] / by_ch["spend"].replace(0, 1)
+
+    # Overlay the optimization action if we have one
+    opt = _state.get("optimization") or {}
+    opt_by_channel = {c.get("channel"): c for c in opt.get("channels", [])}
+
+    channels = []
+    for _, row in by_ch.iterrows():
+        ch = str(row["channel"])
+        ch_opt = opt_by_channel.get(ch, {})
+        current = float(ch_opt.get("current_spend", row["spend"]))
+        optimized = float(ch_opt.get("optimized_spend", row["spend"]))
+        change = optimized - current
+        # Action is based on the *direction* of change, not the raw
+        # threshold (the earlier version had a sign bug: `change > current * 0.02`
+        # is asymmetric in the wrong way because change can be negative).
+        if current > 0 and abs(change) / current > 0.02:
+            action = "increase" if change > 0 else "decrease"
+        else:
+            action = "hold"
+        channels.append({
+            "channel": ch,
+            "channel_display": ch.replace("_", " ").title(),
+            # current_spend uses the optimizer's basis (same as deep-dive's
+            # summary_stats and the Plan screen). Raw `row["spend"]` is the
+            # unnormalized historical sum which can be 4x larger for 4-year
+            # mock data. Keeping one consistent anchor across the product.
+            "current_spend": round(current, 0),
+            # Revenue stays as historical aggregate proportionally scaled
+            # to match the spend basis.
+            "revenue": round(float(row["revenue"]) * (current / max(float(row["spend"]), 1)), 0),
+            "roas": round(float(row["roas"]), 2),
+            "optimal_spend": round(optimized, 0),
+            "change_dollars": round(change, 0),
+            "action": action,
+        })
+
+    # Sort by absolute change (largest movers first — that's what the
+    # default-channel picker uses)
+    channels.sort(key=lambda c: abs(c["change_dollars"]), reverse=True)
+
+    return _j({
+        "channels": channels,
+        "default": channels[0]["channel"] if channels else None,
+    })
+
+
 @app.get("/api/deep-dive/{channel}")
 def get_channel_deep_dive(channel: str):
+    """
+    Per-channel drill-down for Channel Detail screen.
+
+    Extended in v18h to include:
+      - optimization: the plan's optimized spend for this channel (the
+        green marker on the response curve in mockup Image 5). Computed
+        from the cached optimizer result rather than re-running, so
+        these numbers match the Plan screen exactly.
+      - campaigns: campaign-level breakdown (rows for the table at the
+        bottom of the Channel Detail screen per the mockup).
+      - summary_stats: KPI row values (current_spend total, attributed
+        revenue, channel ROAS, confidence tier) so the frontend doesn't
+        have to re-aggregate from monthly_trend.
+    """
     if _state["campaign_data"] is None: raise HTTPException(400, "No data loaded")
     df = _state["campaign_data"]
     ch_data = df[df["channel"] == channel]
     if len(ch_data) == 0: raise HTTPException(404, f"Channel '{channel}' not found")
-    
+
     trend = ch_data.groupby("month").agg(spend=("spend","sum"),revenue=("revenue","sum"),conversions=("conversions","sum"),leads=("leads","sum")).reset_index()
     trend["roi"] = (trend["revenue"] - trend["spend"]) / trend["spend"]
     regional = ch_data.groupby("region").agg(spend=("spend","sum"),revenue=("revenue","sum"),conversions=("conversions","sum")).reset_index()
@@ -735,8 +816,100 @@ def get_channel_deep_dive(channel: str):
     cx = {"avg_bounce_rate":float(ch_data["bounce_rate"].mean()),"avg_session_duration":float(ch_data["avg_session_duration_sec"].mean()),
           "avg_form_completion":float(ch_data["form_completion_rate"].mean()),"avg_nps":float(ch_data["nps_score"].mean())}
     curve_data = _state["curves"].get(channel) if _state["curves"] else None
-    return _j({"channel":channel,"monthly_trend":trend.to_dict(orient="records"),
-               "regional_breakdown":regional.to_dict(orient="records"),"funnel":funnel,"cx_signals":cx,"response_curve":curve_data})
+
+    # Historical aggregates from raw campaign data
+    total_spend = float(ch_data["spend"].sum())
+    total_revenue = float(ch_data["revenue"].sum())
+
+    # Optimization context — which spend does the plan want for this channel?
+    # From the cached optimizer result so these numbers match Plan.
+    optimization = None
+    opt = _state.get("optimization") or {}
+    for ch_opt in opt.get("channels", []):
+        if ch_opt.get("channel") == channel:
+            current_spend = float(ch_opt.get("current_spend", total_spend))
+            optimal_spend = float(ch_opt.get("optimized_spend", total_spend))
+            optimization = {
+                "current_spend": round(current_spend, 0),
+                "optimal_spend": round(optimal_spend, 0),
+                "change_pct": round((optimal_spend - current_spend) / max(current_spend, 1) * 100, 1),
+                "action": "increase" if optimal_spend > current_spend * 1.02
+                          else "decrease" if optimal_spend < current_spend * 0.98
+                          else "hold",
+            }
+            break
+
+    # KPI row values. Important: current_spend uses the optimizer's
+    # normalized basis (the same number the Plan screen shows for this
+    # channel) rather than the raw sum of monthly_trend rows. The
+    # optimizer operates on annualized spend; the raw monthly data
+    # covers the full history, which for 4 years of mock data produces
+    # a 4x-larger number. Using two different anchors here would make
+    # users lose trust ("Plan said $8M, Channel Detail says $34M —
+    # which is it?"). Source of truth = the optimizer.
+    display_current_spend = optimization["current_spend"] if optimization else total_spend
+    # Revenue uses a proportional slice matching the spend basis so ROAS
+    # stays internally consistent (revenue/spend). If we kept the raw
+    # 4-year revenue total with 1-year-equivalent spend, the ROAS KPI
+    # would be wildly wrong.
+    if optimization and total_spend > 0:
+        revenue_scale = display_current_spend / total_spend
+    else:
+        revenue_scale = 1.0
+    display_revenue = total_revenue * revenue_scale
+    display_roas = display_revenue / max(display_current_spend, 1)
+
+    # Campaign-level breakdown — one row per distinct campaign in the data.
+    # Uses whichever column name the mock data happens to have; older data
+    # used "camp", newer "campaign", so we fall back gracefully.
+    campaign_col = "campaign" if "campaign" in ch_data.columns else ("camp" if "camp" in ch_data.columns else None)
+    campaigns = []
+    if campaign_col:
+        by_camp = ch_data.groupby(campaign_col).agg(
+            spend=("spend", "sum"),
+            revenue=("revenue", "sum"),
+            conversions=("conversions", "sum"),
+        ).reset_index()
+        by_camp["roas"] = by_camp["revenue"] / by_camp["spend"].replace(0, 1)
+        by_camp = by_camp.sort_values("spend", ascending=False).head(20)
+        for _, row in by_camp.iterrows():
+            campaigns.append({
+                "campaign": str(row[campaign_col]),
+                "spend": round(float(row["spend"]), 0),
+                "revenue": round(float(row["revenue"]), 0),
+                "roas": round(float(row["roas"]), 2),
+                "conversions": int(row["conversions"]),
+            })
+
+    # Confidence tier for the KPI card — from the curve diagnostics if
+    # available, otherwise derived from R² and data point count.
+    confidence_tier = "Directional"
+    if curve_data and "diagnostics" in curve_data:
+        diag = curve_data["diagnostics"]
+        # Engine returns "High"/"Medium"/"Low"/"Inconclusive" — normalize
+        raw = diag.get("confidence", "Directional")
+        confidence_tier = raw if raw in ("High", "Directional", "Inconclusive") else \
+                         ("High" if raw == "High" else
+                          "Inconclusive" if raw in ("Low", "Inconclusive") else
+                          "Directional")
+
+    return _j({
+        "channel": channel,
+        "channel_display": channel.replace("_", " ").title(),
+        "monthly_trend": trend.to_dict(orient="records"),
+        "regional_breakdown": regional.to_dict(orient="records"),
+        "funnel": funnel,
+        "cx_signals": cx,
+        "response_curve": curve_data,
+        "optimization": optimization,
+        "campaigns": campaigns,
+        "summary_stats": {
+            "current_spend": round(display_current_spend, 0),
+            "attributed_revenue": round(display_revenue, 0),
+            "channel_roas": round(display_roas, 2),
+            "confidence_tier": confidence_tier,
+        },
+    })
 
 
 # ═══════════════════════════════════════════════
@@ -1385,6 +1558,7 @@ def get_executive_summary():
     return PlainTextResponse("\n".join(lines), media_type="text/plain",
                             headers={"Content-Disposition": "attachment; filename=executive_summary.txt"})
 
+
 @app.get("/api/trend-analysis")
 def get_trend_analysis():
     if _state["trend_analysis"] is None:
@@ -1407,11 +1581,160 @@ def get_roi_analysis(gross_margin_pct: float = 0.65):
     return _j(compute_all_roi(_state["campaign_data"], _state.get("curves"), gross_margin_pct))  # ✅ fixed
 
 @app.get("/api/download-template")
-def download_template():
-    template_path = os.path.join(os.path.dirname(__file__), "data", "upload_template.csv")
-    if os.path.exists(template_path):
-        with open(template_path) as f: return JSONResponse(content={"csv": f.read()})
-    raise HTTPException(404, "Template not found")
+def download_template(kind: str = "campaign"):
+    """
+    Serve a blank CSV template the analyst can fill in for a given data
+    type. Powered by the files in /templates/ at the repo root.
+
+    kind values (matched to the 5 upload endpoints):
+      - "campaign"     → campaign_performance_template.csv (primary)
+      - "journeys"     → user_journeys_template.csv
+      - "competitive"  → competitive_intelligence_template.csv
+      - "events"       → market_events_template.csv
+      - "trends"       → market_trends_template.csv
+
+    Returns the CSV as a downloadable file with Content-Disposition so
+    the browser prompts a save dialog rather than rendering in a tab.
+    """
+    template_map = {
+        "campaign":    "campaign_performance_template.csv",
+        "journeys":    "user_journeys_template.csv",
+        "competitive": "competitive_intelligence_template.csv",
+        "events":      "market_events_template.csv",
+        "trends":      "market_trends_template.csv",
+    }
+    filename = template_map.get(kind)
+    if not filename:
+        raise HTTPException(400, f"Unknown template kind: {kind}. Valid: {list(template_map.keys())}")
+
+    # Templates live at <repo_root>/templates/ — one level up from backend/
+    templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
+    template_path = os.path.join(templates_dir, filename)
+
+    if not os.path.exists(template_path):
+        # Fall back to the legacy combined template if the new ones aren't
+        # deployed for some reason (e.g. backend/data/upload_template.csv).
+        # This keeps the endpoint functional during the v18h rollout.
+        legacy_path = os.path.join(os.path.dirname(__file__), "data", "upload_template.csv")
+        if kind == "campaign" and os.path.exists(legacy_path):
+            template_path = legacy_path
+        else:
+            raise HTTPException(404, f"Template file not found: {filename}")
+
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        template_path,
+        media_type="text/csv",
+        filename=filename,
+    )
+
+
+@app.get("/api/analyst-status")
+def analyst_status():
+    """
+    Status payload for the Analyst Tools Hub screen.
+
+    Reports what data has been uploaded, when the model was last run,
+    and what the analyst should do next. Does NOT include actual data
+    (that lives on other endpoints); this is purely metadata for the
+    hub's dashboard.
+    """
+    state = _state
+    has_campaign = state.get("campaign_data") is not None
+    has_journeys = state.get("journey_data") is not None
+    has_competitive = state.get("external_competitive") is not None
+    has_events = state.get("external_events") is not None
+    has_trends = state.get("external_trends") is not None
+    has_analysis = (
+        state.get("curves") is not None
+        and state.get("optimization") is not None
+    )
+
+    # Row counts per loaded dataset
+    def _rows(df):
+        try: return int(len(df)) if df is not None else 0
+        except Exception: return 0
+
+    data_sources = [
+        {
+            "kind": "campaign",
+            "label": "Campaign performance",
+            "description": "Monthly spend, revenue, conversions per channel. Required for all analysis.",
+            "loaded": has_campaign,
+            "rows": _rows(state.get("campaign_data")),
+            "required": True,
+        },
+        {
+            "kind": "journeys",
+            "label": "User journeys",
+            "description": "Multi-touch journey data for attribution modeling. Optional; improves attribution accuracy.",
+            "loaded": has_journeys,
+            "rows": _rows(state.get("journey_data")),
+            "required": False,
+        },
+        {
+            "kind": "competitive",
+            "label": "Competitive intelligence",
+            "description": "Competitor spend data from SEMrush, SimilarWeb, or similar. Optional; informs benchmarks.",
+            "loaded": has_competitive,
+            "rows": _rows(state.get("external_competitive")),
+            "required": False,
+        },
+        {
+            "kind": "events",
+            "label": "Market events & festivities",
+            "description": "Seasonal events, competitor launches, market shifts. Optional; improves diagnostic context.",
+            "loaded": has_events,
+            "rows": _rows(state.get("external_events")),
+            "required": False,
+        },
+        {
+            "kind": "trends",
+            "label": "Market trends",
+            "description": "CPC/CPM trends, Google Trends, category benchmarks. Optional; contextualizes channel cost.",
+            "loaded": has_trends,
+            "rows": _rows(state.get("external_trends")),
+            "required": False,
+        },
+    ]
+
+    # Summary counts for the KPI cards
+    loaded_sources = sum(1 for s in data_sources if s["loaded"])
+    n_channels = 0
+    n_campaigns = 0
+    if has_campaign:
+        df = state["campaign_data"]
+        try:
+            n_channels = int(df["channel"].nunique())
+            for col in ("campaign", "camp"):
+                if col in df.columns:
+                    n_campaigns = int(df[col].nunique())
+                    break
+        except Exception:
+            pass
+
+    # Next-step hint — what should the analyst do?
+    if not has_campaign:
+        next_step = "Upload campaign performance data to begin analysis."
+    elif not has_analysis:
+        next_step = "Data loaded. Re-run analysis to refresh the diagnosis."
+    elif loaded_sources < 3:
+        next_step = "Analysis complete. Consider uploading market events or trends for richer context."
+    else:
+        next_step = "All primary data loaded. Review Diagnosis and Plan for client delivery."
+
+    return _j({
+        "greeting_name": "Sarah",  # Hardcoded for the pitch; becomes dynamic once auth carries full user records
+        "data_sources": data_sources,
+        "stats": {
+            "loaded_sources": loaded_sources,
+            "total_sources": len(data_sources),
+            "channels": n_channels,
+            "campaigns": n_campaigns,
+            "analysis_complete": has_analysis,
+        },
+        "next_step": next_step,
+    })
 
 
 # ═══════════════════════════════════════════════

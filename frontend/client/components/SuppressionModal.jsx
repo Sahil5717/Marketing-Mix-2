@@ -259,7 +259,7 @@ export function SuppressionModal({ finding, onConfirm, onCancel, submitting = fa
           style={{
             padding: `${t.space[4]} ${t.space[6]} ${t.space[5]}`,
             borderTop: `1px solid ${t.color.borderFaint}`,
-            background: t.color.canvasAlt,
+            background: t.color.sunken,
             display: "flex",
             justifyContent: "flex-end",
             gap: t.space[2],

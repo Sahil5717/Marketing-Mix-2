@@ -1,275 +1,521 @@
-import { tokens as t } from "../tokens.js";
-import { KpiPill } from "../components/KpiPill.jsx";
-import { FindingCard } from "../components/FindingCard.jsx";
+import { useMemo, useState } from "react";
+import styled from "styled-components";
+import { t } from "../tokens.js";
+import {
+  HeroRow,
+  HeroLeft,
+  HeroRight,
+  Eyebrow,
+  HeroHeadline,
+  HeroLede,
+} from "../ui/HeroRow.jsx";
+import { KpiHero } from "../ui/KpiHero.jsx";
+import { Byline } from "../ui/Byline.jsx";
+import { Callout } from "../ui/Callout.jsx";
+import { FindingCard } from "../ui/FindingCard.jsx";
+import { SubNav, SubNavTab } from "../ui/SubNav.jsx";
+import { PageShell, TwoColumn, MainColumn, Sidebar } from "../ui/PageShell.jsx";
+import { ConfidenceBar } from "../ui/ConfidenceBar.jsx";
 
 /**
- * Diagnosis screen — the opening surface of MarketLens.
+ * Diagnosis — redesigned per UX handoff + mockup Image 2.
  *
- * Layout, top to bottom:
- *   1. Hero section: headline paragraph + three KPI pills
- *   2. Findings list: 3-5 ranked finding cards, expandable
- *   3. Methodology footer: which engines contributed
+ * Structure:
+ *   Hero (two columns)
+ *     Left: eyebrow + answer-first serif headline + lede + byline
+ *     Right: 3 KPI cards (Portfolio ROAS primary/dark, Value at Risk,
+ *            Plan Confidence with ConfidenceBar)
+ *   SubNav (3 tabs)
+ *     Findings · Channel performance · Data & assumptions
+ *   Body (2 columns)
+ *     Main: findings head + stacked FindingCards
+ *     Sidebar: Editor's Take Callout + Confidence by Finding list
  *
- * The hero section uses a wider width (1100px grid) to accommodate the
- * KPI bento-row. The headline paragraph and findings use the narrower
- * reading width (760px) for legibility — this is prose-heavy content
- * and longer line lengths hurt scan-ability.
+ * Editor mode behavior is threaded through:
+ *   - Suppressed findings appear (dimmed) instead of being hidden
+ *   - Each FindingCard shows Add/Edit note + Hide buttons in a footer strip
+ *   - onCommentaryEdit / onSuppressToggle callbacks handle persistence
  *
- * The "hero card" wrapping the headline paragraph is deliberately
- * prominent -- it's the first thing the reader's eye lands on and sets
- * the tone. Below it the visual weight drops; findings are cards but
- * quieter, establishing hierarchy.
+ * This component is rendered by both DiagnosisApp (client view, no
+ * editor affordances) and EditorApp (editor view, with affordances).
+ * The `editorMode` prop toggles the affordances.
  */
 export function Diagnosis({
   data,
   editorMode = false,
-  onSaveCommentary,
-  onDeleteCommentary,
-  onRequestSuppress,
-  onUnsuppress,
+  onCommentaryEdit,
+  onSuppressToggle,
 }) {
+  // Body tab state — URL-based routing is future work; keep it local
+  // for now to match the mockup's behavior
+  const [activeTab, setActiveTab] = useState("findings");
+
   if (!data) return null;
 
-  const { headline_paragraph, kpis, findings, methodology, data_coverage } = data;
+  const hero = data.hero || {};
+  const kpis = data.kpis || {};
+  const findings = data.findings || [];
+  const visibleFindings = editorMode
+    ? findings
+    : findings.filter((f) => !f.suppressed);
+
+  // Render hero segments — plain text and emphasis (italic accent) fragments
+  const headlineElements = useMemo(() => {
+    const segments = hero.segments || [];
+    return segments.map((seg, i) =>
+      seg.emphasis ? <em key={i}>{seg.text}</em> : <span key={i}>{seg.text}</span>
+    );
+  }, [hero.segments]);
+
+  const portfolioKpi = kpis.portfolio_roas;
+  const varKpi = kpis.value_at_risk;
+  const confKpi = kpis.plan_confidence;
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: t.color.canvas,
-        fontFamily: t.font.body,
-        color: t.color.textPrimary,
-      }}
-    >
-      {/* Section 1 — Hero */}
-      <section
-        style={{
-          maxWidth: t.layout.gridWidth,
-          margin: "0 auto",
-          padding: `${t.space[16]} ${t.space[8]} ${t.space[12]}`,
-        }}
-      >
-        {/* Section label */}
-        <div
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.xs,
-            fontWeight: t.weight.semibold,
-            color: t.color.accent,
-            textTransform: "uppercase",
-            letterSpacing: t.tracking.wider,
-            marginBottom: t.space[4],
-          }}
-        >
-          Diagnosis
-        </div>
+    <Main>
+      {/* ── Hero ── */}
+      <HeroRow>
+        <HeroLeft>
+          <Eyebrow>
+            Diagnosis · Reviewed {data.reviewed_at || formatToday()}
+          </Eyebrow>
 
-        {/* Hero card with the headline paragraph */}
-        <div
-          style={{
-            background: t.color.surface,
-            border: `1px solid ${t.color.border}`,
-            borderRadius: t.radius.xl,
-            padding: `${t.space[10]} ${t.space[12]}`,
-            boxShadow: t.shadow.card,
-            marginBottom: t.space[8],
-            maxWidth: t.layout.readingWidth,
-            animation: `heroFadeIn ${t.motion.slow} ${t.motion.ease} both`,
-          }}
-        >
-          <p
-            style={{
-              fontFamily: t.font.display,
-              fontSize: "clamp(1.375rem, 2.2vw, 1.625rem)",
-              fontWeight: t.weight.regular,
-              color: t.color.textPrimary,
-              letterSpacing: t.tracking.snug,
-              lineHeight: t.leading.relaxed,
-              margin: 0,
-            }}
-          >
-            {headline_paragraph}
-          </p>
-        </div>
+          <HeroHeadline>
+            {headlineElements.length > 0 ? headlineElements : data.headline_paragraph}
+          </HeroHeadline>
 
-        {/* KPI row */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(3, 1fr)",
-            gap: t.space[4],
-            animation: `kpiFadeIn ${t.motion.slow} ${t.motion.ease} 120ms both`,
-          }}
-        >
-          {kpis && (
-            <>
-              <KpiPill
-                label={kpis.portfolio_roas.label}
-                display={kpis.portfolio_roas.display}
-                tone={kpis.portfolio_roas.tone}
-                context={
-                  kpis.portfolio_roas.benchmark
-                    ? `Industry benchmark: ${kpis.portfolio_roas.benchmark}`
-                    : "Revenue per dollar of marketing spend"
-                }
-              />
-              <KpiPill
-                label={kpis.value_at_risk.label}
-                display={kpis.value_at_risk.display}
-                tone={kpis.value_at_risk.tone}
-                context={`${kpis.value_at_risk.pct_of_revenue}% of attributable revenue recoverable`}
-              />
-              <KpiPill
-                label={kpis.plan_confidence.label}
-                display={kpis.plan_confidence.display}
-                tone={kpis.plan_confidence.tone}
-                context="Based on fit quality of underlying models"
-              />
-            </>
-          )}
-        </div>
-      </section>
+          {hero.lede && <HeroLede>{hero.lede}</HeroLede>}
 
-      {/* Section 2 — Findings */}
-      <section
-        style={{
-          maxWidth: t.layout.readingWidth,
-          margin: "0 auto",
-          padding: `${t.space[4]} ${t.space[8]} ${t.space[16]}`,
-        }}
-      >
-        <div
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.xs,
-            fontWeight: t.weight.semibold,
-            color: t.color.accent,
-            textTransform: "uppercase",
-            letterSpacing: t.tracking.wider,
-            marginBottom: t.space[4],
-          }}
-        >
-          Findings
-        </div>
+          <Byline
+            initials={(data.analyst?.initials) || "SR"}
+            name={(data.analyst?.name) || "Sarah Rahman"}
+            role={(data.analyst?.role) || "Senior Manager"}
+            verb="Reviewed by"
+            meta={formatCoverageMeta(data.data_coverage)}
+          />
+        </HeroLeft>
 
-        <h2
-          style={{
-            fontFamily: t.font.display,
-            fontSize: t.size.xl,
-            fontWeight: t.weight.semibold,
-            color: t.color.textPrimary,
-            letterSpacing: t.tracking.tight,
-            lineHeight: t.leading.snug,
-            margin: `0 0 ${t.space[2]} 0`,
-          }}
-        >
-          What the analysis surfaces
-        </h2>
-        <p
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.sm,
-            color: t.color.textSecondary,
-            lineHeight: t.leading.normal,
-            margin: `0 0 ${t.space[8]} 0`,
-          }}
-        >
-          Ranked by estimated impact. Expand any finding to see the underlying evidence.
-        </p>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: t.space[4] }}>
-          {findings && findings.map((f, i) => (
-            <FindingCard
-              key={f.key || i}
-              finding={f}
-              index={i}
-              editorMode={editorMode}
-              onSaveCommentary={onSaveCommentary}
-              onDeleteCommentary={onDeleteCommentary}
-              onRequestSuppress={onRequestSuppress}
-              onUnsuppress={onUnsuppress}
+        <HeroRight>
+          {portfolioKpi && (
+            <KpiHero
+              primary
+              label={portfolioKpi.label}
+              value={portfolioKpi.display.replace(/x$/i, "")}
+              unit={portfolioKpi.display.match(/x$/i) ? "×" : ""}
+              context={portfolioKpi.benchmark ? `Retail benchmark ${portfolioKpi.benchmark}` : undefined}
+              deltaText={portfolioKpi.delta_text}
+              deltaDirection={portfolioKpi.delta_direction}
             />
-          ))}
-        </div>
-      </section>
-
-      {/* Section 3 — Methodology footer */}
-      {methodology && methodology.length > 0 && (
-        <section
-          style={{
-            maxWidth: t.layout.readingWidth,
-            margin: "0 auto",
-            padding: `${t.space[12]} ${t.space[8]} ${t.space[20]}`,
-            borderTop: `1px solid ${t.color.borderFaint}`,
-          }}
-        >
-          <div
-            style={{
-              fontFamily: t.font.body,
-              fontSize: t.size.xs,
-              fontWeight: t.weight.semibold,
-              color: t.color.textTertiary,
-              textTransform: "uppercase",
-              letterSpacing: t.tracking.wider,
-              marginBottom: t.space[4],
-              paddingTop: t.space[8],
-            }}
-          >
-            How we built this
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: t.space[3] }}>
-            {methodology.map((m, i) => (
-              <div
-                key={i}
-                style={{
-                  display: "flex",
-                  alignItems: "baseline",
-                  gap: t.space[4],
-                  padding: `${t.space[3]} 0`,
-                  borderBottom: i < methodology.length - 1 ? `1px solid ${t.color.borderFaint}` : "none",
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: t.font.display,
-                    fontSize: t.size.sm,
-                    fontWeight: t.weight.medium,
-                    color: t.color.textPrimary,
-                    minWidth: "200px",
-                    flexShrink: 0,
-                  }}
-                >
-                  {m.engine}
-                </span>
-                <span
-                  style={{
-                    fontFamily: t.font.body,
-                    fontSize: t.size.sm,
-                    color: t.color.textSecondary,
-                    lineHeight: t.leading.normal,
-                  }}
-                >
-                  {m.method}
-                </span>
-              </div>
-            ))}
-          </div>
-
-          {data_coverage && (
-            <div
-              style={{
-                marginTop: t.space[6],
-                fontFamily: t.font.body,
-                fontSize: t.size.xs,
-                color: t.color.textTertiary,
-              }}
-            >
-              Analysis covers {data_coverage.n_channels} channels across{" "}
-              {data_coverage.n_campaigns} campaigns, {data_coverage.period_rows} data points.
-            </div>
           )}
-        </section>
-      )}
-    </main>
+          {varKpi && (
+            <KpiHero
+              label={varKpi.label}
+              value={varKpi.display.replace(/^\$|M$/g, "")}
+              unit={varKpi.display.endsWith("M") ? "M" : ""}
+              context={varKpi.pct_of_revenue ? `${varKpi.pct_of_revenue}% of attributable revenue` : undefined}
+              deltaText={varKpi.tone === "warning" ? "Recoverable via reallocation" : undefined}
+              deltaDirection="down"
+            />
+          )}
+          {confKpi && (
+            <KpiHero
+              label={confKpi.label}
+              value={confKpi.display}
+              context={confKpi.r_squared ? `Model R² = ${confKpi.r_squared}` : "Based on fit quality of underlying models"}
+              confidence={confKpi.display?.toLowerCase()}
+            />
+          )}
+        </HeroRight>
+      </HeroRow>
+
+      {/* ── SubNav ── */}
+      <SubNav>
+        <SubNavTab
+          label="Findings"
+          count={visibleFindings.length}
+          active={activeTab === "findings"}
+          onClick={() => setActiveTab("findings")}
+        />
+        <SubNavTab
+          label="Channel performance"
+          active={activeTab === "channels"}
+          onClick={() => setActiveTab("channels")}
+        />
+        <SubNavTab
+          label="Data & assumptions"
+          active={activeTab === "data"}
+          onClick={() => setActiveTab("data")}
+        />
+      </SubNav>
+
+      {/* ── Body ── */}
+      <BodyShell>
+        {activeTab === "findings" && (
+          <TwoColumn>
+            <MainColumn>
+              <FindingsHead>
+                <FindingsTitle>What the analysis surfaces</FindingsTitle>
+                <FindingsMeta>
+                  {editorMode
+                    ? "Ranked by estimated impact. Click a finding to add commentary or hide from client."
+                    : "Ranked by estimated impact."}
+                </FindingsMeta>
+              </FindingsHead>
+
+              {visibleFindings.length === 0 && (
+                <EmptyState>No findings surfaced by this analysis.</EmptyState>
+              )}
+
+              {visibleFindings.map((f, i) => (
+                <FindingCard
+                  key={f.key || `f-${i}`}
+                  rank={i + 1}
+                  tier={confidenceTierFor(f.confidence)}
+                  channel={f.evidence_metric?.channel_display || formatChannel(f.evidence_metric?.channel)}
+                  hasEditorNote={!!f.ey_commentary}
+                  headline={f.headline}
+                  subCopy={f.narrative}
+                  impactLabel="Opportunity"
+                  impactValue={formatImpact(f.impact_dollars)}
+                  suppressed={f.suppressed}
+                  editorMode={editorMode}
+                  onEditNote={() => onCommentaryEdit?.(f)}
+                  onToggleSuppress={() => onSuppressToggle?.(f)}
+                />
+              ))}
+            </MainColumn>
+
+            <Sidebar>
+              <EditorTakeCard data={data} />
+              <ConfidenceCard findings={visibleFindings} />
+            </Sidebar>
+          </TwoColumn>
+        )}
+
+        {activeTab === "channels" && (
+          <PlaceholderPane>
+            Channel performance lives on its own screen now —{" "}
+            <a href="?screen=channels" style={{ color: t.color.accent, fontWeight: 600 }}>
+              open the Channels view
+            </a>{" "}
+            for response curves, saturation analysis, and campaign-level detail.
+          </PlaceholderPane>
+        )}
+
+        {activeTab === "data" && (
+          <DataAssumptionsPane data={data} />
+        )}
+      </BodyShell>
+    </Main>
   );
 }
+
+// ─── Sub-components ───
+
+/**
+ * Editor's Take callout — shows analyst commentary on the top finding
+ * if present, or a synthesized take if none. Per the mockup, this is
+ * the most visually distinctive element in the sidebar and earns the
+ * terracotta tint.
+ */
+function EditorTakeCard({ data }) {
+  const findingWithCommentary = (data.findings || []).find((f) => f.ey_commentary);
+  const analyst = data.analyst?.name || "Sarah Rahman";
+
+  if (findingWithCommentary) {
+    return (
+      <Callout label="Editor's Take" byline={`${analyst}, reviewing analyst`}>
+        {findingWithCommentary.ey_commentary.body || findingWithCommentary.ey_commentary}
+      </Callout>
+    );
+  }
+
+  // Fallback — synthesize from the top finding if no commentary exists.
+  // In the real product an analyst would author this; for the pitch we
+  // generate a reasonable default.
+  const topFinding = data.findings?.[0];
+  if (!topFinding) return null;
+  return (
+    <Callout label="Editor's Take" byline={`${analyst}, reviewing analyst`}>
+      {topFinding.narrative}
+    </Callout>
+  );
+}
+
+/**
+ * Confidence by Finding sidebar card — quick scan of which findings
+ * are high-confidence vs directional vs inconclusive. Per mockup
+ * Image 2 it uses the 3-segment ConfidenceBar beside each finding name.
+ */
+function ConfidenceCard({ findings }) {
+  const rows = findings.slice(0, 5).map((f) => ({
+    key: f.key,
+    label: confidenceSidebarLabel(f),
+    tier: confidenceTierFor(f.confidence),
+  }));
+
+  return (
+    <SidebarCard>
+      <SidebarLabel>Confidence by finding</SidebarLabel>
+      <RowList>
+        {rows.map((r) => (
+          <ConfRow key={r.key}>
+            <ConfLabel>{r.label}</ConfLabel>
+            <ConfRight>
+              <ConfidenceBar tier={r.tier} />
+              <ConfTierText>{tierDisplayShort(r.tier)}</ConfTierText>
+            </ConfRight>
+          </ConfRow>
+        ))}
+      </RowList>
+    </SidebarCard>
+  );
+}
+
+function DataAssumptionsPane({ data }) {
+  const cov = data.data_coverage || {};
+  const method = data.methodology || [];
+  return (
+    <PageShell>
+      <PaneSection>
+        <PaneHead>Data coverage</PaneHead>
+        <PaneList>
+          {cov.total_spend && <li>Total spend analyzed: <strong>${formatMoneyPlain(cov.total_spend)}</strong></li>}
+          {cov.total_revenue && <li>Attributable revenue: <strong>${formatMoneyPlain(cov.total_revenue)}</strong></li>}
+          {cov.n_channels && <li>Channels included: <strong>{cov.n_channels}</strong></li>}
+          {cov.n_campaigns && <li>Campaigns: <strong>{cov.n_campaigns}</strong></li>}
+          {cov.period_rows && <li>Observations: <strong>{cov.period_rows.toLocaleString()}</strong></li>}
+        </PaneList>
+      </PaneSection>
+
+      <PaneSection>
+        <PaneHead>Methodology</PaneHead>
+        <PaneList>
+          {method.map((m, i) => (
+            <li key={i}>
+              <strong>{m.engine}:</strong> {m.method}
+            </li>
+          ))}
+        </PaneList>
+      </PaneSection>
+    </PageShell>
+  );
+}
+
+// ─── Helpers ───
+
+function confidenceTierFor(conf) {
+  if (!conf) return "directional";
+  const lower = String(conf).toLowerCase();
+  if (lower.startsWith("high")) return "high";
+  if (lower.startsWith("inconclusive") || lower.startsWith("low")) return "inconclusive";
+  return "directional";
+}
+
+function tierDisplayShort(tier) {
+  if (tier === "high") return "High";
+  if (tier === "directional") return "Dir.";
+  return "Low";
+}
+
+function confidenceSidebarLabel(finding) {
+  // Prefer a short channel-based label if available, else truncate headline
+  const ch = finding.evidence_metric?.channel_display || finding.evidence_metric?.channel;
+  if (ch) return ch.charAt(0).toUpperCase() + ch.slice(1).replaceAll("_", " ");
+  const h = finding.headline || "";
+  return h.length > 28 ? h.slice(0, 28) + "…" : h;
+}
+
+function formatChannel(ch) {
+  if (!ch) return "";
+  return ch.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function formatImpact(dollars) {
+  if (dollars == null) return "—";
+  const abs = Math.abs(dollars);
+  const sign = dollars >= 0 ? "+" : "-";
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1_000) return `${sign}$${Math.round(abs / 1e3)}K`;
+  return `${sign}$${Math.round(abs)}`;
+}
+
+function formatMoneyPlain(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
+  return String(n);
+}
+
+function formatCoverageMeta(coverage) {
+  if (!coverage) return null;
+  const parts = [];
+  if (coverage.n_channels) parts.push(`${coverage.n_channels} channels`);
+  if (coverage.n_campaigns) parts.push(`${coverage.n_campaigns} campaigns`);
+  return parts.join(" · ");
+}
+
+function formatToday() {
+  const d = new Date();
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+// ─── Styled ───
+
+const Main = styled.main`
+  min-height: 100vh;
+  background: ${t.color.canvas};
+  animation: mlFadeIn ${t.motion.slow} ${t.motion.ease};
+`;
+
+const BodyShell = styled.div`
+  max-width: ${t.layout.maxWidth};
+  margin: 0 auto;
+  padding: ${t.space[8]} ${t.layout.pad.wide} ${t.space[16]};
+
+  @media (max-width: ${t.layout.bp.wide}) {
+    padding-left: ${t.layout.pad.narrow};
+    padding-right: ${t.layout.pad.narrow};
+  }
+`;
+
+const FindingsHead = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[2]};
+  margin-bottom: ${t.space[2]};
+`;
+
+const FindingsTitle = styled.h2`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.xl};
+  font-weight: ${t.weight.regular};
+  color: ${t.color.ink};
+  letter-spacing: ${t.tracking.tight};
+  line-height: ${t.leading.snug};
+  margin: 0;
+`;
+
+const FindingsMeta = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink3};
+  margin: 0;
+`;
+
+const EmptyState = styled.div`
+  padding: ${t.space[10]} ${t.space[6]};
+  background: ${t.color.surface};
+  border: 1px dashed ${t.color.border};
+  border-radius: ${t.radius.md};
+  text-align: center;
+  color: ${t.color.ink3};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+`;
+
+const SidebarCard = styled.aside`
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.md};
+  padding: ${t.space[5]} ${t.space[5]};
+  box-shadow: ${t.shadow.card};
+`;
+
+const SidebarLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[3]};
+`;
+
+const RowList = styled.ul`
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[3]};
+`;
+
+const ConfRow = styled.li`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: ${t.space[3]};
+`;
+
+const ConfLabel = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  font-weight: ${t.weight.medium};
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ConfRight = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  flex-shrink: 0;
+`;
+
+const ConfTierText = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink2};
+  font-weight: ${t.weight.semibold};
+  min-width: 32px;
+  text-align: right;
+`;
+
+const PlaceholderPane = styled.div`
+  max-width: ${t.layout.readingWidth};
+  margin: 0 auto;
+  padding: ${t.space[10]} ${t.space[6]};
+  background: ${t.color.surface};
+  border: 1px dashed ${t.color.border};
+  border-radius: ${t.radius.md};
+  text-align: center;
+  color: ${t.color.ink3};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+`;
+
+const PaneSection = styled.section`
+  margin-bottom: ${t.space[8]};
+`;
+
+const PaneHead = styled.h3`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin: 0 0 ${t.space[3]} 0;
+`;
+
+const PaneList = styled.ul`
+  list-style: disc;
+  padding-left: ${t.space[5]};
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink};
+  line-height: ${t.leading.relaxed};
+
+  strong {
+    font-weight: ${t.weight.semibold};
+  }
+`;

@@ -80,6 +80,135 @@ def _plain_channel_name(ch: str) -> str:
     return ch.replace("_", " ").title() if ch else ""
 
 
+def generate_hero_headline(
+    total_revenue: float,
+    roas: float,
+    value_at_risk: float,
+    recs: List[Dict],
+) -> Dict:
+    """
+    Build the structured answer-first headline for the Diagnosis hero.
+
+    Per UX redesign (v18h): the hero needs to deliver the takeaway in one
+    glance, not set up context across a paragraph. The mockup shows
+    headlines like:
+
+        "Portfolio ROAS is 3.2× — above benchmark. But $6.4M is
+         recoverable through reallocation."
+
+    with "3.2×" and "$6.4M" rendered as italic accent-colored fragments.
+
+    We return a structured payload with `segments` so the frontend can
+    apply the italic/accent treatment without regex-parsing a string.
+    Each segment is either plain text or `emphasis=True` (for the
+    key figures the mockup italicizes).
+
+    Decisions this function makes (they're real editorial choices, so
+    worth naming):
+
+      - Anchor on ROAS + recoverable value. Not on revenue, not on
+        spend — executives care about efficiency (ROAS) and opportunity
+        (recoverable).
+      - Two-clause structure: "X is [assessment]. But [contrasting
+        opportunity]." This matches the mockup exactly and gives the
+        reader both the state and the action in one sentence.
+      - Tonal flip only when ROAS is genuinely strong (>=2.5x). If
+        ROAS is poor, lead with the concern, not with "above benchmark."
+    """
+    var_pct = value_at_risk / max(total_revenue, 1) * 100
+    roas_display = f"{roas:.1f}×"
+    var_display = _format_dollars(value_at_risk)
+
+    # Segments: (text, emphasis) — emphasis maps to italic+accent in UI.
+    # Benchmarks — retail CPG is ~2.5-3.0x, B2B SaaS is ~3.0-4.0x. We use
+    # 2.8x as a generic "above benchmark" threshold. Real benchmarks
+    # will come from industry_benchmarks if supplied.
+    if roas >= 2.8 and var_pct > 3:
+        # Strong ROAS but material recoverable — the most common case
+        # and the flagship example in the mockup.
+        segments = [
+            {"text": "Portfolio ROAS is "},
+            {"text": roas_display, "emphasis": True},
+            {"text": " — above benchmark. But "},
+            {"text": var_display, "emphasis": True},
+            {"text": " is recoverable through reallocation."},
+        ]
+        tone = "positive_with_opportunity"
+    elif roas >= 2.8:
+        # Strong ROAS, minimal recoverable — congratulations phrasing
+        segments = [
+            {"text": "Portfolio ROAS is "},
+            {"text": roas_display, "emphasis": True},
+            {"text": " — above benchmark. The plan is largely about "
+             "maintaining the current allocation."},
+        ]
+        tone = "positive"
+    elif roas >= 1.5:
+        # Middle ground — emphasize the opportunity
+        segments = [
+            {"text": "Portfolio ROAS of "},
+            {"text": roas_display, "emphasis": True},
+            {"text": " leaves "},
+            {"text": var_display, "emphasis": True},
+            {"text": " on the table through under-allocated channels."},
+        ]
+        tone = "mixed"
+    else:
+        # Poor ROAS — lead with the concern, not with benchmark comparison
+        segments = [
+            {"text": "Portfolio ROAS of "},
+            {"text": roas_display, "emphasis": True},
+            {"text": " signals structural over-spend. "},
+            {"text": var_display, "emphasis": True},
+            {"text": " is recoverable through disciplined reallocation."},
+        ]
+        tone = "negative"
+
+    # Lede paragraph — provides the "why" in two short sentences. This
+    # supports the headline, doesn't try to be the headline. The mockup
+    # shows this as a ~2-sentence bridge between headline and KPIs.
+    top_rec = _find_top_actionable_recommendation(recs)
+    if top_rec:
+        ch_name = _plain_channel_name(top_rec.get("channel", ""))
+        rec_type = top_rec.get("type", "")
+        # Count distinct channels with significant recommendations to
+        # give the lede a "how many channels" anchor
+        sig_recs = [r for r in recs if abs(r.get("impact", 0)) > 100_000]
+        n_channels = len({r.get("channel") for r in sig_recs if r.get("channel")})
+
+        if rec_type == "SCALE":
+            lede = (
+                f"{ch_name} carries unused headroom relative to its response "
+                f"curve. The plan reallocates across {n_channels} channels "
+                f"without raising total spend."
+            )
+        elif rec_type == "REDUCE":
+            lede = (
+                f"{ch_name} is past saturation; marginal returns have "
+                f"compressed. The plan reallocates across {n_channels} "
+                f"channels to capture the recoverable value."
+            )
+        elif rec_type == "RETARGET":
+            lede = (
+                f"{ch_name} is acquiring customers at a premium to peer "
+                f"channels. Targeting adjustments plus reallocation across "
+                f"{n_channels} channels closes the gap."
+            )
+        else:
+            lede = (
+                f"{n_channels} channels carry meaningful opportunity. "
+                f"The plan rebalances without requiring a spend increase."
+            )
+    else:
+        lede = "The portfolio is operating within expected ranges."
+
+    return {
+        "segments": segments,
+        "lede": lede,
+        "tone": tone,
+    }
+
+
 def generate_diagnosis_paragraph(
     total_spend: float, total_revenue: float, overall_roi: float,
     value_at_risk: float, findings: List[Dict],
@@ -604,6 +733,13 @@ def generate_diagnosis(
         recommendations, response_curves,
     )
 
+    # Structured hero payload for the answer-first v1 design (mockup:
+    # Image 2). The existing headline_paragraph stays as a fallback
+    # for anything still wired to the old shape.
+    hero = generate_hero_headline(
+        total_revenue, roas, value_at_risk, recommendations,
+    )
+
     # ── Layer EY editor overrides onto findings ──
     # Loaded lazily (import inside function) because narrative.py is imported
     # at module load time by the engines package, and persistence.py does
@@ -702,6 +838,7 @@ def generate_diagnosis(
         })
 
     return {
+        "hero": hero,
         "headline_paragraph": headline,
         "kpis": kpis,
         "findings": processed_findings,

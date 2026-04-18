@@ -290,3 +290,153 @@ export async function ensureScenarioReady(view = "client", opts = {}) {
 
   return { data: null, error };
 }
+
+// ─── Analyst Tools Hub screen ───
+
+/**
+ * Fetch the analyst-status payload: what data sources are loaded, how
+ * many rows each, next-step hint, KPI stats for the dashboard cards.
+ */
+export async function fetchAnalystStatus() {
+  return apiRequest("/analyst-status");
+}
+
+/**
+ * Upload a CSV file to the specified data endpoint.
+ * kind values map to the five upload endpoints:
+ *   - "campaign"     → /api/upload
+ *   - "journeys"     → /api/upload-journeys
+ *   - "competitive"  → /api/upload-competitive
+ *   - "events"       → /api/upload-events
+ *   - "trends"       → /api/upload-trends
+ *
+ * Returns { data: {filename, rows, ...}, error } — the shape matches
+ * what the upload endpoints return so the UI can show a summary
+ * (filename, row count, validation warnings).
+ */
+export async function uploadDataFile(kind, file) {
+  const endpointMap = {
+    campaign:    "/upload",
+    journeys:    "/upload-journeys",
+    competitive: "/upload-competitive",
+    events:      "/upload-events",
+    trends:      "/upload-trends",
+  };
+  const path = endpointMap[kind];
+  if (!path) {
+    return {
+      data: null,
+      error: { kind: "client", message: `Unknown upload kind: ${kind}` },
+    };
+  }
+
+  const form = new FormData();
+  form.append("file", file);
+
+  try {
+    const auth = getStoredAuth();
+    const headers = {};
+    if (auth?.token) headers.Authorization = `Bearer ${auth.token}`;
+
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      body: form,
+      headers,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      return {
+        data: null,
+        error: { kind: "http", status: res.status, message: text || `${res.status}` },
+      };
+    }
+    return { data: await res.json(), error: null };
+  } catch (err) {
+    return {
+      data: null,
+      error: { kind: "network", message: err?.message || "Upload failed" },
+    };
+  }
+}
+
+/**
+ * URL to download a template CSV for a given data kind. Used as the
+ * href on the "Download template" link in the Upload UI.
+ */
+export function templateDownloadUrl(kind) {
+  return `${API_BASE}/download-template?kind=${encodeURIComponent(kind)}`;
+}
+
+/**
+ * Kick off a fresh analysis run. Called after the analyst uploads new
+ * data to refresh all screens.
+ */
+export async function runFullAnalysis() {
+  return apiRequest("/run-analysis", { method: "POST" });
+}
+
+export async function ensureAnalystHubReady() {
+  const { data, error } = await fetchAnalystStatus();
+  if (data) return { data, error: null };
+  return { data: null, error };
+}
+
+// ─── Channel Detail screen ───
+
+/**
+ * Fetch the list of channels with current/optimal spend + action.
+ * Powers the Channel Detail picker dropdown and the default-channel
+ * resolution when user hits the Channels nav without a specific slug.
+ */
+export async function fetchChannelsList() {
+  return apiRequest("/channels");
+}
+
+/**
+ * Fetch the per-channel deep dive payload. Includes monthly trend,
+ * regional breakdown, funnel, CX signals, response curve points,
+ * optimizer context, campaign-level rows, and summary KPI stats.
+ */
+export async function fetchChannelDeepDive(channel) {
+  return apiRequest(`/deep-dive/${encodeURIComponent(channel)}`);
+}
+
+/**
+ * Cold-start variant: ensure analysis has run, then fetch the
+ * requested channel's deep dive. If no channel specified, resolves
+ * to the backend's default (largest absolute change from optimizer).
+ * Returns { deepDive, channels } so the picker has options.
+ */
+export async function ensureChannelDetailReady(channelSlug) {
+  if (!channelSlug) {
+    const listFirst = await fetchChannelsList();
+    if (listFirst.error && listFirst.error.kind === "http" && listFirst.error.status === 400) {
+      const mock = await loadMockData();
+      if (mock.error) return { data: null, error: mock.error };
+      const analysis = await runAnalysis();
+      if (analysis.error) return { data: null, error: analysis.error };
+      const retry = await fetchChannelsList();
+      if (retry.error) return { data: null, error: retry.error };
+      channelSlug = retry.data.default;
+    } else if (listFirst.data) {
+      channelSlug = listFirst.data.default;
+    } else {
+      return { data: null, error: listFirst.error };
+    }
+  }
+
+  const [deepRes, listRes] = await Promise.all([
+    fetchChannelDeepDive(channelSlug),
+    fetchChannelsList(),
+  ]);
+
+  if (deepRes.error) return { data: null, error: deepRes.error };
+
+  return {
+    data: {
+      deepDive: deepRes.data,
+      channels: listRes.data?.channels || [],
+    },
+    error: null,
+  };
+}

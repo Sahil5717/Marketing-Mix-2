@@ -1,669 +1,865 @@
-import { useState, useEffect, useCallback } from "react";
-import { tokens as t } from "../tokens.js";
-import { fetchScenario, fetchScenarioPresets } from "../api.js";
-import { KpiPill } from "../components/KpiPill.jsx";
-import { MoveCard } from "../components/MoveCard.jsx";
-import { TradeoffCard } from "../components/TradeoffCard.jsx";
+import { useState, useCallback, useEffect, useMemo } from "react";
+import styled, { css } from "styled-components";
+import { t } from "../tokens.js";
+import {
+  fetchScenarioPresets,
+  fetchScenario,
+} from "../api.js";
+import { Callout } from "../ui/Callout.jsx";
+import { MoveCard } from "../ui/MoveCard.jsx";
+import { TwoColumn, MainColumn, Sidebar } from "../ui/PageShell.jsx";
 
 /**
- * Scenarios screen — the "what if we did X instead?" surface.
+ * Scenarios — redesigned per UX handoff + mockup Image 4.
  *
- * Same visual structure as Diagnosis and Plan (hero, KPIs, moves,
- * tradeoffs) but with a control panel at the top that lets the user
- * choose a budget scenario. Four presets (Current, Cut 20%, Increase
- * 25%, Optimizer recommended) plus a custom budget input for the
- * "what if" they don't see in the preset list.
+ * Different shape from Diagnosis/Plan: this is a control-first surface,
+ * not a narrative one. The hero is the interactive controls (preset
+ * row + custom input), and the narrative elements (Scenario Note) are
+ * demoted to the sidebar.
  *
- * Above the moves: a comparison card showing the deltas vs. baseline
- * (the current allocation at current spend). This is what justifies
- * the screen's existence as separate from Plan — Plan tells you what
- * to do; Scenarios shows what happens if you don't.
+ * Structure:
+ *   Zone 1 (controls):
+ *     Eyebrow · Serif h1 with italic accent on "total budget"
+ *     Paragraph
+ *     Preset row (4 cards — Baseline / Conservative / Optimized / Aggressive),
+ *       one preset uses dark-inverted treatment as the "Recommended" anchor
+ *     Custom budget input: $ prefix, numeric input, "million / year" suffix,
+ *       Run scenario button
  *
- * Editor controls (commentary / suppress) deliberately NOT wired here.
- * Scenarios are exploratory — the EY analyst's curation belongs on
- * the Diagnosis and Plan screens that get published. A scenario is a
- * tool the analyst USES, not a deliverable they CURATE.
+ *   Zone 2 (comparison):
+ *     Three-column card: Current Plan → Selected Scenario = Delta
+ *     Serif arrow separators between columns
+ *
+ *   Zone 3 (allocation + sidebar):
+ *     Main: "Allocation under this scenario" heading + stacked MoveCards
+ *     Sidebar: Scenario Note callout (serif italic pull-quote)
+ *
+ * Client-vs-editor boundary (per user decision, not the designer's
+ * original handoff):
+ *   - Clients CAN use the preset row and custom input (run scenarios)
+ *   - Clients CANNOT save scenarios
+ *   - Editor mode adds a "Save current scenario" button to the sidebar
+ *     (rendered here, but the persistence API is an editor-only
+ *      endpoint that clients cannot reach by construction)
+ *
+ * The designer's saved-scenarios sidebar (showing a list of named
+ * scenarios) is NOT in v1 — it's queued for post-v1. For now, the
+ * Save button is a placeholder hook.
  */
-export function Scenarios({ data: initialData, initialPreset = null, view = "client" }) {
-  // Initial data is whatever was loaded by the app shell (the baseline
-  // scenario by default). The screen manages its own subsequent fetches
-  // when the user clicks presets, so the state lives here, not in the
-  // shell.
-  const [scenarioData, setScenarioData] = useState(initialData);
-  const [presets, setPresets] = useState([]);
-  const [activePreset, setActivePreset] = useState(initialPreset || "baseline");
+export function Scenarios({ data: initialData, view = "client" }) {
+  // Initial payload from the shell's ensureScenarioReady() call — this
+  // is the baseline (current-spend) scenario. User interactions trigger
+  // fresh fetches that replace this.
+  const [data, setData] = useState(initialData);
+  const [presets, setPresets] = useState(null);
+  const [activePreset, setActivePreset] = useState("baseline");
   const [customBudget, setCustomBudget] = useState("");
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [runError, setRunError] = useState(null);
 
-  // Load presets on mount
+  // Load presets once on mount
   useEffect(() => {
-    (async () => {
-      const { data } = await fetchScenarioPresets();
-      if (data?.presets) setPresets(data.presets);
-    })();
+    let cancelled = false;
+    fetchScenarioPresets().then(({ data: p, error }) => {
+      if (!cancelled && p) {
+        setPresets(p);
+        // Initialize custom budget field to current spend (in $M)
+        const currentM = (p.current_spend || 0) / 1e6;
+        setCustomBudget(currentM.toFixed(1));
+      }
+    });
+    return () => { cancelled = true; };
   }, []);
 
-  const runScenario = useCallback(async (totalBudget, presetKey = null) => {
+  const runScenario = useCallback(async ({ totalBudget, presetKey }) => {
     setLoading(true);
-    setError(null);
-    const { data, error: err } = await fetchScenario({ totalBudget, view });
+    setRunError(null);
+    const { data: d, error } = await fetchScenario({
+      totalBudget,
+      view,
+    });
     setLoading(false);
-    if (err) {
-      setError(err.message || "Couldn't run scenario");
-      return;
+    if (d) {
+      setData(d);
+      setActivePreset(presetKey || "custom");
+    } else if (error) {
+      setRunError(
+        error.message || "Failed to run scenario. Check connection and try again."
+      );
     }
-    setScenarioData(data);
-    setActivePreset(presetKey || "custom");
   }, [view]);
 
-  function handlePresetClick(preset) {
-    setCustomBudget(""); // clear the custom input when a preset is chosen
-    runScenario(preset.total_budget, preset.key);
-  }
+  const handlePresetClick = useCallback((preset) => {
+    runScenario({
+      totalBudget: preset.total_budget,
+      presetKey: preset.key,
+    });
+    // Sync the custom input to show the preset's value
+    setCustomBudget((preset.total_budget / 1e6).toFixed(1));
+  }, [runScenario]);
 
-  function handleCustomSubmit(e) {
-    e.preventDefault();
-    const value = parseFloat(customBudget);
-    if (!isFinite(value) || value <= 0) return;
-    // Convert from millions back to dollars (the input is in $M)
-    runScenario(value * 1_000_000, "custom");
-  }
+  const handleCustomRun = useCallback(() => {
+    const n = parseFloat(customBudget);
+    if (Number.isNaN(n) || n <= 0) {
+      setRunError("Enter a positive number for total budget.");
+      return;
+    }
+    runScenario({
+      totalBudget: n * 1e6,
+      presetKey: "custom",
+    });
+  }, [customBudget, runScenario]);
 
-  if (!scenarioData) return null;
+  const handleSaveScenario = useCallback(() => {
+    // Placeholder — wire to /api/scenarios/save in a later session
+    alert("Save — wired to /api/scenarios/save in a later session");
+  }, []);
 
-  const { headline_paragraph, kpis, moves, tradeoffs, comparison } = scenarioData;
-  const increases = (moves || []).filter((m) => m.action === "increase");
-  const decreases = (moves || []).filter((m) => m.action === "decrease");
-  const holds = (moves || []).filter((m) => m.action === "hold");
+  // Derived data
+  const comparison = data?.comparison;
+  const moves = (data?.moves || []).filter((m) => !m.suppressed);
+  const scenarioNote = useMemo(() => {
+    // Use the first warning-severity tradeoff if present; else first tradeoff
+    const trs = data?.tradeoffs || [];
+    return trs.find((tr) => tr.severity === "warning") || trs[0] || null;
+  }, [data]);
+
+  if (!data && !presets) return null;
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: t.color.canvas,
-        fontFamily: t.font.body,
-        color: t.color.textPrimary,
-      }}
-    >
-      {/* Section 1 — Hero with controls */}
-      <section
-        style={{
-          maxWidth: t.layout.gridWidth,
-          margin: "0 auto",
-          padding: `${t.space[16]} ${t.space[8]} ${t.space[8]}`,
-        }}
-      >
-        <div
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.xs,
-            fontWeight: t.weight.semibold,
-            color: t.color.accent,
-            textTransform: "uppercase",
-            letterSpacing: t.tracking.wider,
-            marginBottom: t.space[4],
-          }}
-        >
-          Scenarios
-        </div>
+    <Main>
+      {/* ─── Zone 1: Controls ─── */}
+      <ControlsShell>
+        <Eyebrow>
+          <EyebrowDot /> Scenarios · What-if explorer
+        </Eyebrow>
 
-        <h1
-          style={{
-            fontFamily: t.font.display,
-            fontSize: "clamp(1.75rem, 3vw, 2.25rem)",
-            fontWeight: t.weight.semibold,
-            color: t.color.textPrimary,
-            letterSpacing: t.tracking.tight,
-            lineHeight: t.leading.tight,
-            margin: `0 0 ${t.space[3]} 0`,
-            maxWidth: t.layout.readingWidth,
-          }}
-        >
-          What happens if we change the budget?
-        </h1>
-        <p
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.lg,
-            color: t.color.textSecondary,
-            lineHeight: t.leading.relaxed,
-            margin: `0 0 ${t.space[8]} 0`,
-            maxWidth: t.layout.readingWidth,
-          }}
-        >
-          Pick a preset or set a custom budget. The model re-optimizes the channel allocation for the new spend level and shows the projected outcome compared to today's baseline.
-        </p>
+        <Headline>
+          What happens if we change the <em>total budget</em>?
+        </Headline>
+        <Lede>
+          Pick a preset or set a custom total spend. The optimizer re-runs the
+          allocation and shows projected outcomes compared to the current plan.
+        </Lede>
 
-        {/* Control panel: presets + custom input */}
-        <ControlPanel
-          presets={presets}
-          activePreset={activePreset}
-          customBudget={customBudget}
-          onCustomBudgetChange={setCustomBudget}
-          onPresetClick={handlePresetClick}
-          onCustomSubmit={handleCustomSubmit}
-          loading={loading}
-        />
-
-        {error && (
-          <div
-            style={{
-              marginTop: t.space[4],
-              padding: `${t.space[3]} ${t.space[4]}`,
-              background: t.color.negativeBg,
-              color: t.color.negative,
-              borderLeft: `3px solid ${t.color.negative}`,
-              borderRadius: t.radius.sm,
-              fontFamily: t.font.body,
-              fontSize: t.size.sm,
-            }}
-            role="alert"
-          >
-            {error}
-          </div>
-        )}
-      </section>
-
-      {/* Section 2 — Comparison card (the "vs. baseline" summary) */}
-      {comparison && (
-        <section
-          style={{
-            maxWidth: t.layout.gridWidth,
-            margin: "0 auto",
-            padding: `0 ${t.space[8]} ${t.space[10]}`,
-          }}
-        >
-          <ComparisonCard comparison={comparison} />
-        </section>
-      )}
-
-      {/* Section 3 — KPI row */}
-      {kpis && kpis.reallocation_size && (
-        <section
-          style={{
-            maxWidth: t.layout.gridWidth,
-            margin: "0 auto",
-            padding: `0 ${t.space[8]} ${t.space[12]}`,
-          }}
-        >
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
-              gap: t.space[4],
-            }}
-          >
-            <KpiPill
-              label={kpis.reallocation_size.label}
-              display={kpis.reallocation_size.display}
-              tone={kpis.reallocation_size.tone}
-              context={kpis.reallocation_size.context}
-            />
-            <KpiPill
-              label={kpis.expected_uplift.label}
-              display={kpis.expected_uplift.display}
-              tone={kpis.expected_uplift.tone}
-              context={kpis.expected_uplift.context}
-            />
-            <KpiPill
-              label={kpis.plan_confidence.label}
-              display={kpis.plan_confidence.display}
-              tone={kpis.plan_confidence.tone}
-              context={kpis.plan_confidence.context}
-            />
-          </div>
-        </section>
-      )}
-
-      {/* Section 4 — Allocation under this scenario */}
-      <section
-        style={{
-          maxWidth: t.layout.readingWidth,
-          margin: "0 auto",
-          padding: `0 ${t.space[8]} ${t.space[12]}`,
-        }}
-      >
-        <h2
-          style={{
-            fontFamily: t.font.display,
-            fontSize: t.size.xl,
-            fontWeight: t.weight.semibold,
-            color: t.color.textPrimary,
-            letterSpacing: t.tracking.tight,
-            lineHeight: t.leading.snug,
-            margin: `0 0 ${t.space[2]} 0`,
-          }}
-        >
-          Allocation under this scenario
-        </h2>
-        <p
-          style={{
-            fontFamily: t.font.body,
-            fontSize: t.size.sm,
-            color: t.color.textSecondary,
-            margin: `0 0 ${t.space[8]} 0`,
-          }}
-        >
-          {headline_paragraph}
-        </p>
-
-        {increases.length > 0 && (
-          <MoveGroup label={`Increase (${increases.length})`} moves={increases} startIndex={0} />
-        )}
-        {decreases.length > 0 && (
-          <MoveGroup label={`Reduce (${decreases.length})`} moves={decreases} startIndex={increases.length} />
-        )}
-        {holds.length > 0 && (
-          <MoveGroup label={`Hold (${holds.length})`} moves={holds} startIndex={increases.length + decreases.length} />
-        )}
-      </section>
-
-      {/* Section 5 — Tradeoffs */}
-      {tradeoffs && tradeoffs.length > 0 && (
-        <section
-          style={{
-            maxWidth: t.layout.readingWidth,
-            margin: "0 auto",
-            padding: `0 ${t.space[8]} ${t.space[20]}`,
-          }}
-        >
-          <div
-            style={{
-              fontFamily: t.font.body,
-              fontSize: t.size.xs,
-              fontWeight: t.weight.semibold,
-              color: t.color.accent,
-              textTransform: "uppercase",
-              letterSpacing: t.tracking.wider,
-              marginBottom: t.space[4],
-            }}
-          >
-            Tradeoffs
-          </div>
-          <h2
-            style={{
-              fontFamily: t.font.display,
-              fontSize: t.size.xl,
-              fontWeight: t.weight.semibold,
-              color: t.color.textPrimary,
-              letterSpacing: t.tracking.tight,
-              margin: `0 0 ${t.space[6]} 0`,
-            }}
-          >
-            What this scenario assumes
-          </h2>
-          <div style={{ display: "flex", flexDirection: "column", gap: t.space[3] }}>
-            {tradeoffs.map((tr, i) => (
-              <TradeoffCard key={tr.key || i} tradeoff={tr} index={i} />
+        {/* Preset row */}
+        {presets && (
+          <PresetRow>
+            {presets.presets?.map((p) => (
+              <PresetCard
+                key={p.key}
+                preset={p}
+                active={activePreset === p.key}
+                recommended={p.key === "recommended"}
+                onClick={() => handlePresetClick(p)}
+                disabled={loading}
+              />
             ))}
-          </div>
-        </section>
-      )}
-    </main>
-  );
-}
+          </PresetRow>
+        )}
 
-// ─── Control panel ───
-
-function ControlPanel({ presets, activePreset, customBudget, onCustomBudgetChange, onPresetClick, onCustomSubmit, loading }) {
-  return (
-    <div
-      style={{
-        background: t.color.surface,
-        border: `1px solid ${t.color.border}`,
-        borderRadius: t.radius.lg,
-        padding: `${t.space[6]} ${t.space[6]}`,
-        boxShadow: t.shadow.card,
-        display: "flex",
-        flexDirection: "column",
-        gap: t.space[5],
-      }}
-    >
-      <div
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.xs,
-          fontWeight: t.weight.semibold,
-          color: t.color.textTertiary,
-          textTransform: "uppercase",
-          letterSpacing: t.tracking.wider,
-        }}
-      >
-        Choose a scenario
-      </div>
-
-      {/* Preset buttons */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: t.space[3] }}>
-        {presets.map((p) => (
-          <PresetButton
-            key={p.key}
-            preset={p}
-            active={activePreset === p.key}
-            disabled={loading}
-            onClick={() => onPresetClick(p)}
-          />
-        ))}
-      </div>
-
-      {/* Custom budget input */}
-      <form
-        onSubmit={onCustomSubmit}
-        style={{
-          display: "flex",
-          alignItems: "flex-end",
-          gap: t.space[3],
-          paddingTop: t.space[5],
-          borderTop: `1px solid ${t.color.borderFaint}`,
-        }}
-      >
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: t.space[2] }}>
-          <label
-            htmlFor="custom-budget"
-            style={{
-              fontFamily: t.font.body,
-              fontSize: t.size.xs,
-              fontWeight: t.weight.semibold,
-              color: t.color.textSecondary,
-              textTransform: "uppercase",
-              letterSpacing: t.tracking.wider,
-            }}
-          >
-            Or set a custom budget
-          </label>
-          <div style={{ display: "flex", alignItems: "center", gap: t.space[2] }}>
-            <span style={{ fontFamily: t.font.body, fontSize: t.size.md, color: t.color.textTertiary }}>
-              $
-            </span>
-            <input
-              id="custom-budget"
+        {/* Custom input */}
+        <CustomRow>
+          <CustomLabel>Custom budget</CustomLabel>
+          <CustomInputWrap>
+            <DollarPrefix>$</DollarPrefix>
+            <CustomInput
               type="number"
+              inputMode="decimal"
+              step="0.1"
+              min="0"
               value={customBudget}
-              onChange={(e) => onCustomBudgetChange(e.target.value)}
-              placeholder="e.g. 30"
-              min="0.1"
-              step="0.5"
+              onChange={(e) => setCustomBudget(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleCustomRun(); }}
               disabled={loading}
-              style={{
-                flex: 1,
-                padding: `${t.space[2]} ${t.space[3]}`,
-                border: `1px solid ${t.color.border}`,
-                borderRadius: t.radius.sm,
-                fontFamily: t.font.body,
-                fontSize: t.size.md,
-                color: t.color.textPrimary,
-                background: t.color.canvas,
-                outline: "none",
-                maxWidth: "180px",
-              }}
+              placeholder="48.7"
             />
-            <span
-              style={{
-                fontFamily: t.font.body,
-                fontSize: t.size.sm,
-                color: t.color.textTertiary,
-              }}
-            >
-              million / year
-            </span>
-          </div>
-        </div>
-        <button
-          type="submit"
-          disabled={loading || !customBudget}
-          style={{
-            padding: `${t.space[2]} ${t.space[5]}`,
-            background: t.color.accent,
-            color: t.color.textInverse,
-            border: "none",
-            borderRadius: t.radius.sm,
-            fontFamily: t.font.body,
-            fontSize: t.size.sm,
-            fontWeight: t.weight.semibold,
-            cursor: loading || !customBudget ? "not-allowed" : "pointer",
-            opacity: loading || !customBudget ? 0.5 : 1,
-            transition: `opacity ${t.motion.fast} ${t.motion.ease}`,
-          }}
-        >
-          {loading ? "Running…" : "Run scenario"}
-        </button>
-      </form>
-    </div>
+            <CustomSuffix>million / year</CustomSuffix>
+          </CustomInputWrap>
+          <RunButton onClick={handleCustomRun} disabled={loading}>
+            {loading ? "Running…" : "Run scenario"}
+          </RunButton>
+        </CustomRow>
+
+        {runError && <ErrorBanner>{runError}</ErrorBanner>}
+      </ControlsShell>
+
+      {/* ─── Zone 2: Comparison card ─── */}
+      {comparison && (
+        <ComparisonShell>
+          <ComparisonCard comparison={comparison} />
+        </ComparisonShell>
+      )}
+
+      {/* ─── Zone 3: Allocation + sidebar ─── */}
+      <BodyShell>
+        <TwoColumn>
+          <MainColumn>
+            <AllocationHead>
+              <AllocationTitle>Allocation under this scenario</AllocationTitle>
+              <AllocationMeta>
+                {activePreset === "custom"
+                  ? "Custom budget"
+                  : presets?.presets?.find((p) => p.key === activePreset)?.label || "Baseline"}
+                {moves.length > 0 ? ` · ${moves.length} channels affected` : ""}
+              </AllocationMeta>
+            </AllocationHead>
+
+            {moves.length === 0 && (
+              <EmptyState>
+                No reallocation under this scenario — the allocation is the same as the current plan.
+              </EmptyState>
+            )}
+
+            {moves.map((m) => (
+              <MoveCard
+                key={m.key}
+                tier={reliabilityToTier(m.reliability)}
+                channel={formatChannel(m.channel)}
+                action={makeActionHtml(m)}
+                deltaValue={m.revenue_delta_display || m.spend_delta_display}
+                deltaPct={m.change_pct != null ? `${signed(m.change_pct)}%` : undefined}
+                deltaDirection={m.action === "increase" ? "up" : m.action === "decrease" ? "down" : "neutral"}
+                beforeSpend={formatMoneyShort(m.current_spend)}
+                afterSpend={formatMoneyShort(m.optimized_spend)}
+              />
+            ))}
+          </MainColumn>
+
+          <Sidebar>
+            {scenarioNote && (
+              <Callout label="Scenario note" byline={`${data?.analyst?.name || "Sarah Rahman"}, reviewing analyst`}>
+                {scenarioNote.narrative || scenarioNote.headline}
+              </Callout>
+            )}
+            {view === "editor" && (
+              <SaveScenarioCard onSave={handleSaveScenario} />
+            )}
+          </Sidebar>
+        </TwoColumn>
+      </BodyShell>
+    </Main>
   );
 }
 
-function PresetButton({ preset, active, disabled, onClick }) {
+// ─── Sub-components ───
+
+/**
+ * PresetCard — one of the four preset buttons in the preset row.
+ * The "Recommended" preset gets the dark-inverted treatment shown
+ * in the mockup (parallel to the primary KpiHero variant). Other
+ * presets are light. Active state on any preset adds an accent border.
+ */
+function PresetCard({ preset, active, recommended, onClick, disabled }) {
+  // The "Recommended" preset uses the inverted (dark) treatment when
+  // it's the ACTIVE preset, matching the mockup's "PRESET · OPTIMIZED"
+  // card which is dark when selected. Non-active recommended is still
+  // highlighted but less aggressively.
+  const inverted = active && recommended;
+
   return (
-    <button
+    <PresetButton
       onClick={onClick}
       disabled={disabled}
-      style={{
-        textAlign: "left",
-        padding: `${t.space[4]} ${t.space[4]}`,
-        background: active ? t.color.accentSubtle : t.color.canvas,
-        border: `1px solid ${active ? t.color.accent : t.color.border}`,
-        borderRadius: t.radius.md,
-        cursor: disabled ? "not-allowed" : "pointer",
-        opacity: disabled && !active ? 0.5 : 1,
-        transition: `background ${t.motion.fast} ${t.motion.ease}, border-color ${t.motion.fast} ${t.motion.ease}`,
-        display: "flex",
-        flexDirection: "column",
-        gap: t.space[2],
-        fontFamily: "inherit",
-      }}
-      onMouseEnter={(e) => {
-        if (!disabled && !active) {
-          e.currentTarget.style.background = t.color.surfaceSunken;
-          e.currentTarget.style.borderColor = t.color.borderStrong;
-        }
-      }}
-      onMouseLeave={(e) => {
-        if (!disabled && !active) {
-          e.currentTarget.style.background = t.color.canvas;
-          e.currentTarget.style.borderColor = t.color.border;
-        }
-      }}
+      $active={active}
+      $inverted={inverted}
+      $recommended={recommended}
     >
-      <div
-        style={{
-          fontFamily: t.font.display,
-          fontSize: t.size.md,
-          fontWeight: t.weight.semibold,
-          color: active ? t.color.accent : t.color.textPrimary,
-          letterSpacing: t.tracking.snug,
-        }}
-      >
-        {preset.label}
-      </div>
-      <div
-        style={{
-          fontFamily: t.font.display,
-          fontSize: t.size.lg,
-          fontWeight: t.weight.semibold,
-          color: t.color.textPrimary,
-          letterSpacing: t.tracking.tight,
-        }}
-      >
+      <PresetEyebrow $inverted={inverted}>
+        Preset · {preset.label.toUpperCase()}
+      </PresetEyebrow>
+      <PresetName $inverted={inverted}>
+        {presetNameFor(preset)}
+      </PresetName>
+      <PresetValue $inverted={inverted}>
         ${(preset.total_budget / 1e6).toFixed(1)}M
-      </div>
-      <div
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.xs,
-          color: t.color.textTertiary,
-          lineHeight: t.leading.normal,
-        }}
-      >
-        {preset.description}
-      </div>
-    </button>
+      </PresetValue>
+      {recommended && (
+        <PresetHint $inverted={inverted}>
+          {active ? "Recommended — matches Plan screen" : "Recommended"}
+        </PresetHint>
+      )}
+      {!recommended && preset.description && (
+        <PresetHint $inverted={inverted}>
+          {shortDescription(preset)}
+        </PresetHint>
+      )}
+    </PresetButton>
   );
 }
 
-// ─── Comparison card ───
-
+/**
+ * ComparisonCard — the three-column "Current Plan → Scenario = Delta" card.
+ * Serif arrow characters between columns. Shows the comparison at a
+ * glance. Per handoff: "the killer element of this screen — answers
+ * 'what would change?' at a glance."
+ */
 function ComparisonCard({ comparison }) {
-  const { narrative, scenario, baseline, deltas } = comparison;
-  const revPositive = deltas.revenue_delta > 0;
-  const roiPositive = deltas.roi_delta > 0;
+  const baseline = comparison.baseline || {};
+  const scenario = comparison.scenario || {};
+  const deltas = comparison.deltas || {};
+
+  const revenueDelta = deltas.revenue_delta || 0;
+  const roiDelta = deltas.roi_delta || 0;
+  const budgetDelta = deltas.budget_delta || 0;
+
+  const deltaHeading = describeDelta(budgetDelta, revenueDelta);
 
   return (
-    <div
-      style={{
-        background: t.color.surface,
-        border: `1px solid ${t.color.border}`,
-        borderRadius: t.radius.xl,
-        padding: `${t.space[8]} ${t.space[10]}`,
-        boxShadow: t.shadow.card,
-      }}
-    >
-      <div
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.xs,
-          fontWeight: t.weight.semibold,
-          color: t.color.textTertiary,
-          textTransform: "uppercase",
-          letterSpacing: t.tracking.wider,
-          marginBottom: t.space[4],
-        }}
-      >
-        Compared to baseline
-      </div>
+    <CompCard>
+      <CompCol>
+        <CompLabel>Current Plan</CompLabel>
+        <CompValue className="tabular">{formatMoneyDisplay(baseline.total_budget)}</CompValue>
+        <CompSub>
+          Revenue: {formatMoneyDisplay(baseline.projected_revenue)} · ROAS: {baseline.projected_roi?.toFixed(2)}×
+        </CompSub>
+      </CompCol>
 
-      <p
-        style={{
-          fontFamily: t.font.display,
-          fontSize: "clamp(1.25rem, 1.8vw, 1.5rem)",
-          fontWeight: t.weight.regular,
-          color: t.color.textPrimary,
-          lineHeight: t.leading.relaxed,
-          letterSpacing: t.tracking.snug,
-          margin: `0 0 ${t.space[8]} 0`,
-        }}
-      >
-        {narrative}
-      </p>
+      <CompArrow aria-hidden="true">→</CompArrow>
 
-      {/* Delta grid */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: t.space[6],
-          paddingTop: t.space[6],
-          borderTop: `1px solid ${t.color.borderFaint}`,
-        }}
-      >
-        <DeltaCell
-          label="Budget"
-          baselineValue={`$${(baseline.total_budget / 1e6).toFixed(1)}M`}
-          scenarioValue={`$${(scenario.total_budget / 1e6).toFixed(1)}M`}
-          delta={deltas.budget_delta}
-          format={(v) => `${v >= 0 ? "+" : "-"}$${(Math.abs(v) / 1e6).toFixed(1)}M`}
-          tone="neutral"
-        />
-        <DeltaCell
-          label="Projected revenue"
-          baselineValue={`$${(baseline.projected_revenue / 1e6).toFixed(1)}M`}
-          scenarioValue={`$${(scenario.projected_revenue / 1e6).toFixed(1)}M`}
-          delta={deltas.revenue_delta}
-          format={(v) => `${v >= 0 ? "+" : "-"}$${(Math.abs(v) / 1e6).toFixed(1)}M`}
-          tone={revPositive ? "positive" : "warning"}
-        />
-        <DeltaCell
-          label="Portfolio ROI"
-          baselineValue={`${baseline.projected_roi.toFixed(1)}x`}
-          scenarioValue={`${scenario.projected_roi.toFixed(1)}x`}
-          delta={deltas.roi_delta}
-          format={(v) => `${v >= 0 ? "+" : ""}${v.toFixed(2)}x`}
-          tone={roiPositive ? "positive" : "warning"}
-        />
-      </div>
-    </div>
+      <CompCol>
+        <CompLabel>Selected Scenario</CompLabel>
+        <CompValue className="tabular">{formatMoneyDisplay(scenario.total_budget)}</CompValue>
+        <CompSub>
+          Revenue: {formatMoneyDisplay(scenario.projected_revenue)} · ROAS: {scenario.projected_roi?.toFixed(2)}×
+        </CompSub>
+      </CompCol>
+
+      <CompArrowEquals aria-hidden="true">=</CompArrowEquals>
+
+      <CompCol $isDelta>
+        <CompLabel>Delta</CompLabel>
+        <CompValue className="tabular" $direction={revenueDelta >= 0 ? "up" : "down"}>
+          {formatSignedMoney(revenueDelta)}
+        </CompValue>
+        <CompSub $direction={revenueDelta >= 0 ? "up" : "down"}>
+          {deltaHeading}
+        </CompSub>
+      </CompCol>
+    </CompCard>
   );
 }
 
-function DeltaCell({ label, baselineValue, scenarioValue, delta, format, tone }) {
-  const toneColor = tone === "positive" ? t.color.positive : tone === "warning" ? t.color.warning : t.color.textSecondary;
+function SaveScenarioCard({ onSave }) {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: t.space[2] }}>
-      <span
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.xs,
-          fontWeight: t.weight.semibold,
-          color: t.color.textTertiary,
-          textTransform: "uppercase",
-          letterSpacing: t.tracking.wider,
-        }}
-      >
-        {label}
-      </span>
-      <div style={{ display: "flex", alignItems: "baseline", gap: t.space[2] }}>
-        <span
-          style={{
-            fontFamily: t.font.display,
-            fontSize: t.size.xs,
-            color: t.color.textTertiary,
-            fontWeight: t.weight.regular,
-          }}
-        >
-          {baselineValue}
-        </span>
-        <span style={{ fontFamily: t.font.body, fontSize: t.size.xs, color: t.color.textTertiary }}>
-          →
-        </span>
-        <span
-          style={{
-            fontFamily: t.font.display,
-            fontSize: t.size.xl,
-            fontWeight: t.weight.semibold,
-            color: t.color.textPrimary,
-            letterSpacing: t.tracking.tight,
-            lineHeight: t.leading.tight,
-          }}
-        >
-          {scenarioValue}
-        </span>
-      </div>
-      <span
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.sm,
-          fontWeight: t.weight.semibold,
-          color: toneColor,
-        }}
-      >
-        {format(delta)}
-      </span>
-    </div>
+    <SidebarCard>
+      <SidebarLabel>Saved scenarios (editor)</SidebarLabel>
+      <SidebarCopy>
+        Save the current scenario to share with the client for later review.
+      </SidebarCopy>
+      <SaveButton onClick={onSave}>Save current scenario</SaveButton>
+    </SidebarCard>
   );
 }
 
-// ─── Move group ───
+// ─── Helpers ───
 
-function MoveGroup({ label, moves, startIndex = 0 }) {
-  return (
-    <div style={{ marginBottom: t.space[8] }}>
-      <div
-        style={{
-          fontFamily: t.font.body,
-          fontSize: t.size.xs,
-          fontWeight: t.weight.semibold,
-          color: t.color.textTertiary,
-          textTransform: "uppercase",
-          letterSpacing: t.tracking.wider,
-          marginBottom: t.space[3],
-        }}
-      >
-        {label}
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: t.space[3] }}>
-        {moves.map((m, i) => (
-          <MoveCard key={m.key} move={m} index={startIndex + i} editorMode={false} />
-        ))}
-      </div>
-    </div>
-  );
+function presetNameFor(preset) {
+  // Match the mockup's preset names which are more evocative than the
+  // backend's terse labels. Backend sends "Cut 20%" — we show
+  // "Cut total spend". Backend sends "Optimizer recommended" — we show
+  // "Hold total, reallocate".
+  const map = {
+    baseline: "Current plan",
+    conservative: "Cut total spend",
+    growth: "Increase budget",
+    recommended: "Hold total, reallocate",
+  };
+  return map[preset.key] || preset.label;
 }
+
+function shortDescription(preset) {
+  const map = {
+    baseline: "Today's allocation, no changes",
+    conservative: "Tighten spend; preserve highest-ROI channels",
+    growth: "Test headroom at higher spend",
+    recommended: "Recommended — matches Plan screen",
+  };
+  return map[preset.key] || "";
+}
+
+function reliabilityToTier(r) {
+  const l = String(r || "").toLowerCase();
+  if (l === "high") return "high";
+  if (l === "inconclusive" || l === "low") return "inconclusive";
+  return "directional";
+}
+
+function formatChannel(ch) {
+  if (!ch) return "";
+  return ch.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function formatMoneyShort(n) {
+  if (n == null) return null;
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1_000) return `$${Math.round(n / 1e3)}K`;
+  return `$${Math.round(n)}`;
+}
+
+function formatMoneyDisplay(n) {
+  // Comparison card uses slightly longer formatting for clarity — the
+  // card has room and "$48.7M" reads better than "$48.7M" at this size
+  if (n == null) return "—";
+  if (Math.abs(n) >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (Math.abs(n) >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+  return `$${Math.round(n)}`;
+}
+
+function formatSignedMoney(n) {
+  const sign = n >= 0 ? "+" : "-";
+  const abs = Math.abs(n);
+  if (abs === 0) return "$0";
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${sign}$${Math.round(abs / 1e3)}K`;
+  return `${sign}$${Math.round(abs)}`;
+}
+
+function signed(n) {
+  if (n == null) return "";
+  return n >= 0 ? `+${n.toFixed(1)}` : n.toFixed(1);
+}
+
+function describeDelta(budgetDelta, revenueDelta) {
+  // Short phrase describing what kind of trade this scenario represents
+  if (Math.abs(revenueDelta) < 1e5) return "Same spend, same revenue";
+  if (budgetDelta === 0 && revenueDelta > 0) return "Same spend, more revenue";
+  if (budgetDelta === 0 && revenueDelta < 0) return "Same spend, less revenue";
+  if (budgetDelta > 0 && revenueDelta > 0) return "More spend, more revenue";
+  if (budgetDelta > 0 && revenueDelta < 0) return "More spend, less revenue";
+  if (budgetDelta < 0 && revenueDelta > 0) return "Less spend, more revenue";
+  if (budgetDelta < 0 && revenueDelta < 0) return "Less spend, less revenue";
+  return "";
+}
+
+function makeActionHtml(m) {
+  const before = escapeHtml(formatMoneyShort(m.current_spend) || "");
+  const after = escapeHtml(formatMoneyShort(m.optimized_spend) || "");
+  if (m.action === "increase") {
+    return `Increase spend from <strong>${before}</strong> to <strong>${after}</strong>. ${descriptor(m)}`;
+  }
+  if (m.action === "decrease") {
+    return `Pull back from <strong>${before}</strong> to <strong>${after}</strong>. ${descriptor(m)}`;
+  }
+  return `Hold at <strong>${before}</strong>. ${descriptor(m)}`;
+}
+
+function descriptor(m) {
+  const n = m.narrative || "";
+  const firstSentence = n.split(/[.!?]/)[0];
+  return escapeHtml(firstSentence ? firstSentence + "." : "");
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+// ─── Styled ───
+
+const Main = styled.main`
+  min-height: 100vh;
+  background: ${t.color.canvas};
+  animation: mlFadeIn ${t.motion.slow} ${t.motion.ease};
+`;
+
+const ControlsShell = styled.section`
+  max-width: ${t.layout.maxWidth};
+  margin: 0 auto;
+  padding: ${t.space[10]} ${t.layout.pad.wide} ${t.space[8]};
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[4]};
+
+  @media (max-width: ${t.layout.bp.wide}) {
+    padding-left: ${t.layout.pad.narrow};
+    padding-right: ${t.layout.pad.narrow};
+  }
+`;
+
+const Eyebrow = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  color: ${t.color.accentInk};
+`;
+
+const EyebrowDot = styled.span`
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: ${t.color.accent};
+`;
+
+const Headline = styled.h1`
+  font-family: ${t.font.serif};
+  font-size: clamp(32px, 4vw, 48px);
+  font-weight: ${t.weight.regular};
+  line-height: ${t.leading.snug};
+  letter-spacing: ${t.tracking.tight};
+  color: ${t.color.ink};
+  margin: ${t.space[2]} 0 0 0;
+  max-width: 820px;
+
+  em, i {
+    font-style: italic;
+    color: ${t.color.accent};
+    font-weight: ${t.weight.regular};
+  }
+`;
+
+const Lede = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.md};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+  max-width: 680px;
+`;
+
+const PresetRow = styled.div`
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: ${t.space[3]};
+  margin-top: ${t.space[4]};
+
+  @media (max-width: 900px) {
+    grid-template-columns: repeat(2, 1fr);
+  }
+`;
+
+const PresetButton = styled.button`
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[2]};
+  padding: ${t.space[5]} ${t.space[5]};
+  border-radius: ${t.radius.lg};
+  background: ${({ $inverted }) => ($inverted ? t.color.dark : t.color.surface)};
+  border: 1px solid ${({ $active, $inverted }) =>
+    $inverted ? "transparent" :
+    $active ? t.color.accent :
+    t.color.border};
+  box-shadow: ${({ $inverted }) => ($inverted ? "none" : t.shadow.card)};
+  text-align: left;
+  cursor: pointer;
+  transition: transform ${t.motion.base} ${t.motion.ease},
+              box-shadow ${t.motion.base} ${t.motion.ease},
+              border-color ${t.motion.base} ${t.motion.ease};
+
+  &:hover:not(:disabled) {
+    ${({ $inverted }) => !$inverted && css`
+      box-shadow: ${t.shadow.raised};
+      border-color: ${t.color.borderStrong};
+    `}
+  }
+
+  &:disabled {
+    opacity: 0.65;
+    cursor: wait;
+  }
+`;
+
+const PresetEyebrow = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  letter-spacing: ${t.tracking.wider};
+  color: ${({ $inverted }) => ($inverted ? t.color.ink4 : t.color.ink3)};
+`;
+
+const PresetName = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.md};
+  font-weight: ${t.weight.semibold};
+  color: ${({ $inverted }) => ($inverted ? t.color.inkInverse : t.color.ink)};
+`;
+
+const PresetValue = styled.span`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.xl};
+  font-weight: ${t.weight.regular};
+  letter-spacing: ${t.tracking.tight};
+  line-height: 1;
+  color: ${({ $inverted }) => ($inverted ? t.color.inkInverse : t.color.ink)};
+`;
+
+const PresetHint = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${({ $inverted }) => ($inverted ? t.color.ink4 : t.color.ink3)};
+  line-height: ${t.leading.normal};
+`;
+
+const CustomRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: ${t.space[4]};
+  padding: ${t.space[5]} ${t.space[6]};
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.md};
+  box-shadow: ${t.shadow.card};
+
+  @media (max-width: 700px) {
+    flex-wrap: wrap;
+  }
+`;
+
+const CustomLabel = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  color: ${t.color.ink3};
+  min-width: 130px;
+`;
+
+const CustomInputWrap = styled.div`
+  display: flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  flex: 1;
+`;
+
+const DollarPrefix = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.md};
+  color: ${t.color.ink3};
+`;
+
+const CustomInput = styled.input`
+  width: 120px;
+  padding: ${t.space[2]} ${t.space[3]};
+  background: ${t.color.canvas};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.sm};
+  font-family: ${t.font.serif};
+  font-size: ${t.size.lg};
+  font-weight: ${t.weight.regular};
+  color: ${t.color.ink};
+  letter-spacing: ${t.tracking.tight};
+
+  &:focus {
+    border-color: ${t.color.accent};
+    outline: none;
+  }
+`;
+
+const CustomSuffix = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink3};
+`;
+
+const RunButton = styled.button`
+  padding: ${t.space[3]} ${t.space[5]};
+  background: ${t.color.dark};
+  color: ${t.color.inkInverse};
+  border: none;
+  border-radius: ${t.radius.sm};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.semibold};
+  cursor: pointer;
+  transition: background ${t.motion.base} ${t.motion.ease};
+
+  &:hover:not(:disabled) {
+    background: ${t.color.darkSurface};
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: wait;
+  }
+`;
+
+const ErrorBanner = styled.div`
+  padding: ${t.space[3]} ${t.space[4]};
+  background: ${t.color.negativeBg};
+  border: 1px solid ${t.color.negative}33;
+  border-radius: ${t.radius.sm};
+  color: ${t.color.negative};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+`;
+
+const ComparisonShell = styled.section`
+  max-width: ${t.layout.maxWidth};
+  margin: 0 auto;
+  padding: 0 ${t.layout.pad.wide};
+
+  @media (max-width: ${t.layout.bp.wide}) {
+    padding-left: ${t.layout.pad.narrow};
+    padding-right: ${t.layout.pad.narrow};
+  }
+`;
+
+const CompCard = styled.div`
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto 1fr;
+  align-items: center;
+  gap: ${t.space[4]};
+  padding: ${t.space[6]} ${t.space[8]};
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.lg};
+  box-shadow: ${t.shadow.card};
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    text-align: center;
+  }
+`;
+
+const CompCol = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[1]};
+  min-width: 0;
+`;
+
+const CompLabel = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  color: ${t.color.ink3};
+`;
+
+const CompValue = styled.span`
+  font-family: ${t.font.serif};
+  font-size: clamp(28px, 3vw, 40px);
+  font-weight: ${t.weight.regular};
+  letter-spacing: ${t.tracking.tightest};
+  line-height: 1;
+  color: ${({ $direction }) =>
+    $direction === "up" ? t.color.positive :
+    $direction === "down" ? t.color.negative :
+    t.color.ink};
+`;
+
+const CompSub = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${({ $direction }) =>
+    $direction === "up" ? t.color.positive :
+    $direction === "down" ? t.color.negative :
+    t.color.ink3};
+`;
+
+const CompArrow = styled.span`
+  font-family: ${t.font.serif};
+  font-size: ${t.size["3xl"]};
+  color: ${t.color.ink3};
+  line-height: 1;
+
+  @media (max-width: 900px) {
+    display: none;
+  }
+`;
+
+const CompArrowEquals = styled(CompArrow)``;
+
+const BodyShell = styled.div`
+  max-width: ${t.layout.maxWidth};
+  margin: 0 auto;
+  padding: ${t.space[8]} ${t.layout.pad.wide} ${t.space[16]};
+
+  @media (max-width: ${t.layout.bp.wide}) {
+    padding-left: ${t.layout.pad.narrow};
+    padding-right: ${t.layout.pad.narrow};
+  }
+`;
+
+const AllocationHead = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: ${t.space[3]};
+  margin-bottom: ${t.space[4]};
+`;
+
+const AllocationTitle = styled.h2`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.xl};
+  font-weight: ${t.weight.regular};
+  color: ${t.color.ink};
+  letter-spacing: ${t.tracking.tight};
+  margin: 0;
+`;
+
+const AllocationMeta = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink3};
+`;
+
+const EmptyState = styled.div`
+  padding: ${t.space[10]} ${t.space[6]};
+  background: ${t.color.surface};
+  border: 1px dashed ${t.color.border};
+  border-radius: ${t.radius.md};
+  text-align: center;
+  color: ${t.color.ink3};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+`;
+
+const SidebarCard = styled.aside`
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.md};
+  padding: ${t.space[5]};
+  box-shadow: ${t.shadow.card};
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[3]};
+`;
+
+const SidebarLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+`;
+
+const SidebarCopy = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+`;
+
+const SaveButton = styled.button`
+  padding: ${t.space[2]} ${t.space[3]};
+  background: ${t.color.surface};
+  color: ${t.color.ink};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.sm};
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.medium};
+  cursor: pointer;
+  align-self: flex-start;
+  transition: background ${t.motion.base} ${t.motion.ease}, border-color ${t.motion.base} ${t.motion.ease};
+
+  &:hover {
+    background: ${t.color.sunken};
+    border-color: ${t.color.borderStrong};
+  }
+`;

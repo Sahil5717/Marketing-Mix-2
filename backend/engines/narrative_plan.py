@@ -231,6 +231,130 @@ def build_moves(opt_channels: List[Dict], curves: Optional[Dict] = None) -> List
     return moves
 
 
+def generate_plan_hero(summary: Dict, moves: List[Dict]) -> Dict:
+    """
+    Build the structured answer-first hero for the Plan screen.
+
+    Per UX redesign (mockup Image 3). The headline reads:
+        "Reallocate $4.8M across six channels. Total spend holds at
+         $48.7M; expected revenue lift is +$24.3M."
+
+    with "$4.8M" and "+$24.3M" rendered as italic accent-colored
+    fragments. Same segments[] pattern as the Diagnosis hero.
+
+    Two-clause structure: action clause ("Reallocate X across N channels")
+    then outcome clause ("Total spend holds at Y; expected revenue lift
+    is Z"). Picked this shape because Plan is prescriptive — it answers
+    "what do we do?" not "what's wrong?" — and the shape mirrors that:
+    first what you do, then what you get.
+    """
+    total_budget = float(summary.get("total_budget", 0))
+    revenue_uplift = float(summary.get("revenue_uplift", 0))
+
+    increases = [m for m in moves if m["action"] == "increase"]
+    decreases = [m for m in moves if m["action"] == "decrease"]
+    affected = increases + decreases
+    n_channels = len({m["channel"] for m in affected})
+
+    # Reallocation magnitude — half the sum of absolute deltas, same
+    # as generate_plan_headline uses. Each dollar moved appears once
+    # as a subtraction and once as an addition, so dividing by 2 gives
+    # the true net reallocation size.
+    total_moved = sum(abs(m["spend_delta"]) for m in moves) / 2
+    reallocation_display = _format_dollars(total_moved)
+    uplift_display = _signed_dollars(revenue_uplift)
+    total_budget_display = _format_dollars(total_budget)
+
+    # Channel count word — mockup uses "six" for 6. We do the same for
+    # 1-10 (reads better in serif display type than a digit); higher
+    # counts fall back to digits because spelling them out gets awkward.
+    channel_word = _number_word(n_channels)
+
+    # Hero branches — different structure depending on the shape of the plan
+    if n_channels == 0 or total_moved < total_budget * 0.01:
+        # No meaningful reallocation — plan is essentially "hold current"
+        segments = [
+            {"text": "Current allocation is close to optimal. The plan is "
+                     "largely about maintaining today's portfolio."},
+        ]
+        tone = "hold"
+    elif revenue_uplift <= 0:
+        # Reallocating for structure not yield (rare but possible)
+        segments = [
+            {"text": "Reallocate "},
+            {"text": reallocation_display, "emphasis": True},
+            {"text": f" across {channel_word} channels to rebalance the "
+                     "portfolio. Total spend holds at "},
+            {"text": total_budget_display, "emphasis": False},
+            {"text": "."},
+        ]
+        tone = "rebalance"
+    else:
+        # Standard case — reallocation with expected uplift
+        segments = [
+            {"text": "Reallocate "},
+            {"text": reallocation_display, "emphasis": True},
+            {"text": f" across {channel_word} channels. Total spend holds at "},
+            {"text": total_budget_display, "emphasis": False},
+            {"text": "; expected revenue lift is "},
+            {"text": uplift_display, "emphasis": True},
+            {"text": "."},
+        ]
+        tone = "reallocate_with_uplift"
+
+    # Lede — supports the headline. Mentions what's increasing and
+    # what's decreasing, and the phasing intent. Keep to 2 sentences max.
+    if increases and decreases:
+        top_inc_names = [_plain_channel_name(m["channel"]) for m in increases[:2]]
+        top_dec_names = [_plain_channel_name(m["channel"]) for m in decreases[:2]]
+        lede = (
+            f"Cuts in {_join_and(top_dec_names)} fund shifts into "
+            f"{_join_and(top_inc_names)} where response curves show the "
+            f"best marginal return. No channel is dropped entirely — "
+            f"the plan is a rebalancing, not a restructuring."
+        )
+    elif increases:
+        top_inc_names = [_plain_channel_name(m["channel"]) for m in increases[:2]]
+        lede = (
+            f"The plan scales {_join_and(top_inc_names)} where response "
+            f"curves show meaningful headroom. Other channels hold."
+        )
+    elif decreases:
+        top_dec_names = [_plain_channel_name(m["channel"]) for m in decreases[:2]]
+        lede = (
+            f"The plan pulls spend from {_join_and(top_dec_names)} which are "
+            f"operating past their efficient frontier. Other channels hold."
+        )
+    else:
+        lede = "The allocation is close to optimal; only minor adjustments are suggested."
+
+    return {
+        "segments": segments,
+        "lede": lede,
+        "tone": tone,
+    }
+
+
+def _number_word(n: int) -> str:
+    """Spell out small counts — reads better in serif display type."""
+    words = {
+        0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+        6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+    }
+    return words.get(n, str(n))
+
+
+def _join_and(items: List[str]) -> str:
+    """Oxford-comma join: ['A','B','C'] -> 'A, B, and C'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
 def generate_plan_headline(summary: Dict, moves: List[Dict]) -> str:
     """
     2-3 sentence consulting-style rationale for the plan.
@@ -468,6 +592,7 @@ def generate_plan(
         processed_moves.append(m)
 
     headline = generate_plan_headline(summary, moves)
+    hero = generate_plan_hero(summary, moves)
     tradeoffs = build_tradeoffs(opt_info, moves, response_curves or {})
 
     # Plan confidence logic: derived from optimizer convergence + curve
@@ -507,6 +632,7 @@ def generate_plan(
     ]
 
     return {
+        "hero": hero,
         "headline_paragraph": headline,
         "kpis": kpis,
         "moves": processed_moves,

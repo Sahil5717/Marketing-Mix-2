@@ -1,18 +1,18 @@
-import { tokens as t } from "./tokens.js";
+import { t } from "./tokens.js";
 import { LoginScreen } from "./screens/LoginScreen.jsx";
-import { GlobalStyles } from "./DiagnosisApp.jsx";
+import { GlobalStyle } from "./globalStyle.js";
 
 /**
  * LoginApp — minimal shell for the /login route.
  *
- * Renders just the login screen with the shared GlobalStyles so fonts
- * and animations match the rest of MarketLens. No header, no footer —
- * a login page is a focal surface, not a chrome-heavy one.
+ * Renders the login screen with the shared GlobalStyle so fonts load
+ * consistently. No header, no footer — the login page is a focal
+ * surface carrying its own two-column layout (dark brand panel + form).
  */
 export default function LoginApp() {
   return (
     <div style={{ minHeight: "100vh", background: t.color.canvas, fontFamily: t.font.body }}>
-      <GlobalStyles />
+      <GlobalStyle />
       <LoginScreen />
     </div>
   );
