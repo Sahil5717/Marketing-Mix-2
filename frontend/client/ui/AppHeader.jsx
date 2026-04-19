@@ -23,12 +23,14 @@ export function AppHeader({
   auth,
   editorMode = false,
   engagementMeta,
+  bayesStatus,       // { state, message, elapsed_s, r_hat_max, ess_min } — editor mode only
+  onBayesRefresh,    // callback to trigger /api/bayes-refit
   onSignOut,
   onShare,
 }) {
   return (
     <HeaderBar $editor={editorMode}>
-      <Inner>
+      <Inner $editor={editorMode}>
         <BrandNav>
           <Brand href={editorMode ? "/editor" : "/"}>
             <BrandMark>M</BrandMark>
@@ -37,17 +39,24 @@ export function AppHeader({
 
           <Nav>
             {editorMode && (
+              <NavItem screen="engagements" current={currentScreen} label="Engagements" />
+            )}
+            {editorMode && (
               <NavItem screen="hub" current={currentScreen} label="Workspace" />
             )}
             <NavItem screen="diagnosis" current={currentScreen} label="Diagnosis" />
             <NavItem screen="plan" current={currentScreen} label="Plan" />
             <NavItem screen="scenarios" current={currentScreen} label="Scenarios" />
             <NavItem screen="channels" current={currentScreen} label="Channels" />
+            <NavItem screen="market" current={currentScreen} label="Market" />
           </Nav>
         </BrandNav>
 
         <MetaGroup>
           {editorMode && <EditorBadge>✎ Editor mode</EditorBadge>}
+          {editorMode && bayesStatus && (
+            <MmmChip status={bayesStatus} onRefresh={onBayesRefresh} />
+          )}
           {engagementMeta && (
             <Engagement>
               <strong>{engagementMeta.client}</strong>
@@ -88,6 +97,66 @@ function UserChip({ auth, onSignOut }) {
   );
 }
 
+/**
+ * MmmChip — always visible in editor mode. Communicates which MMM method
+ * is currently backing the numbers in the UI.
+ *
+ * State semantics:
+ *   idle        → "Bayesian MMM queued" (before first run-analysis)
+ *   pending     → "Bayesian MMM queued"
+ *   running     → "Bayesian running · {elapsed}s" with spinner
+ *   ready       → "Bayesian ready · r̂ {r_hat}" with green dot; clicking refreshes
+ *   non_converged → "Bayesian did not converge" (muted warning)
+ *   failed      → "Bayesian fit failed" (red warning)
+ *
+ * In any non-ready state, the UI falls back to frequentist results.
+ * The chip is the user's honest signal about which model they're seeing.
+ */
+function MmmChip({ status, onRefresh }) {
+  const state = status?.state || "idle";
+  const isRunning = state === "pending" || state === "running";
+  const isReady = state === "ready";
+  const isFailed = state === "failed";
+  const isNonConv = state === "non_converged";
+
+  let label;
+  if (isReady) {
+    const rhat = status.r_hat_max != null ? status.r_hat_max.toFixed(2) : "—";
+    label = `Bayesian ready · r̂ ${rhat}`;
+  } else if (isRunning) {
+    const elapsed = status.elapsed_s != null
+      ? `${Math.round(status.elapsed_s)}s`
+      : status.state === "running" ? "sampling…" : "queued";
+    label = `Bayesian ${elapsed}`;
+  } else if (isFailed) {
+    label = "Bayesian fit failed";
+  } else if (isNonConv) {
+    label = "Bayesian did not converge";
+  } else {
+    label = "Bayesian MMM queued";
+  }
+
+  const clickable = isReady && typeof onRefresh === "function";
+  const methodologyNote =
+    "PyMC NUTS · 6 channels · adstock + Hill saturation · 300 draws × 2 chains · converged at r-hat < 1.05";
+  const tooltip = isReady
+    ? `${status.message || ""}\n${methodologyNote}\nClick to re-run`
+    : isRunning
+      ? `${status.message || ""}\n${methodologyNote}`
+      : status?.message || "Bayesian MMM status";
+  return (
+    <MmmChipWrap
+      $state={state}
+      $clickable={clickable}
+      onClick={clickable ? onRefresh : undefined}
+      title={tooltip}
+    >
+      <MmmChipDot $state={state} />
+      <MmmChipLabel>{label}</MmmChipLabel>
+    </MmmChipWrap>
+  );
+}
+
 // ─── Styled components ───
 
 const HeaderBar = styled.header`
@@ -98,36 +167,42 @@ const HeaderBar = styled.header`
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border-bottom: 1px solid ${t.color.borderFaint};
-  height: ${t.layout.headerHeight};
 
-  /* Below 1280px the editor view's chrome overflows one row.
-     Drop the fixed height and let Inner wrap to two rows. */
-  @media (max-width: 1279px) {
+  /* Editor mode has 7-8 discrete header pieces (Workspace nav + 4 analysis
+     nav items + Editor badge + engagement meta + Share + user chip + sign
+     out) — way too many for one row below ~1600px. Strategy: in editor
+     mode, always split to two rows (BrandNav on top, MetaGroup below).
+     Client mode has less chrome and fits one row on any reasonable desktop. */
+  height: ${({ $editor }) => ($editor ? "auto" : t.layout.headerHeight)};
+  min-height: ${t.layout.headerHeight};
+
+  /* Client mode: only wrap at narrow viewports (<1200px). */
+  @media (max-width: 1199px) {
     height: auto;
-    min-height: ${t.layout.headerHeight};
   }
 `;
 
 const Inner = styled.div`
   max-width: ${t.layout.maxWidth};
-  height: 100%;
   margin: 0 auto;
-  padding: 0 ${t.layout.pad.wide};
+  padding: ${({ $editor }) => ($editor ? `${t.space[2]} ${t.layout.pad.wide}` : `0 ${t.layout.pad.wide}`)};
+  height: ${({ $editor }) => ($editor ? "auto" : "100%")};
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: ${t.space[6]};
+  gap: ${t.space[4]};
   min-width: 0;
 
-  /* Wrap to a second row on narrower viewports — BrandNav on top,
-     MetaGroup on the second row. Cleaner than ellipsis-hiding any
-     of the meta info. */
-  @media (max-width: 1279px) {
+  /* Editor mode: always stacked as two rows.
+     Client mode: single row until it overflows. */
+  flex-wrap: ${({ $editor }) => ($editor ? "wrap" : "nowrap")};
+  row-gap: ${t.space[2]};
+
+  @media (max-width: 1199px) {
     flex-wrap: wrap;
-    height: auto;
     padding-top: ${t.space[2]};
     padding-bottom: ${t.space[2]};
-    row-gap: ${t.space[2]};
+    height: auto;
   }
 
   @media (max-width: ${t.layout.bp.wide}) {
@@ -140,6 +215,7 @@ const BrandNav = styled.div`
   display: flex;
   align-items: center;
   gap: ${t.space[8]};
+  flex-shrink: 0;  /* nav items never compress */
   min-width: 0;
 `;
 
@@ -171,6 +247,7 @@ const Nav = styled.nav`
   display: flex;
   align-items: center;
   gap: ${t.space[1]};
+  flex-wrap: wrap;  /* allow nav to wrap if truly tiny viewport, but items themselves never shrink */
 `;
 
 const NavLink = styled.a`
@@ -182,6 +259,8 @@ const NavLink = styled.a`
   font-size: ${t.size.base};
   font-weight: ${t.weight.medium};
   text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: background ${t.motion.base} ${t.motion.ease}, color ${t.motion.base} ${t.motion.ease};
 
   ${({ $active }) =>
@@ -214,6 +293,8 @@ const MetaGroup = styled.div`
   font-size: ${t.size.sm};
   color: ${t.color.ink2};
   min-width: 0;
+  flex-wrap: wrap;
+  row-gap: ${t.space[2]};
 `;
 
 const EditorBadge = styled.span`
@@ -227,6 +308,8 @@ const EditorBadge = styled.span`
   font-size: ${t.size.xs};
   font-weight: ${t.weight.semibold};
   letter-spacing: ${t.tracking.wider};
+  white-space: nowrap;   /* "Editor mode" never wraps */
+  flex-shrink: 0;
 `;
 
 const Engagement = styled.div`
@@ -283,6 +366,8 @@ const UserChipWrap = styled.div`
   gap: ${t.space[2]};
   padding-left: ${t.space[3]};
   border-left: 1px solid ${t.color.borderFaint};
+  flex-shrink: 0;
+  white-space: nowrap;
 `;
 
 const UserName = styled.span`
@@ -290,6 +375,7 @@ const UserName = styled.span`
   font-size: ${t.size.sm};
   font-weight: ${t.weight.medium};
   color: ${t.color.ink};
+  white-space: nowrap;
 `;
 
 const UserRole = styled.span`
@@ -299,6 +385,7 @@ const UserRole = styled.span`
   text-transform: uppercase;
   letter-spacing: ${t.tracking.wider};
   font-weight: ${t.weight.semibold};
+  white-space: nowrap;
 `;
 
 const SignOutLink = styled.button`
@@ -311,8 +398,79 @@ const SignOutLink = styled.button`
   color: ${t.color.accent};
   font-weight: ${t.weight.medium};
   cursor: pointer;
+  white-space: nowrap;
 
   &:hover {
     color: ${t.color.accentHover};
   }
+`;
+
+// ─── MMM chip ───
+
+const MmmChipWrap = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  padding: 3px ${t.space[3]};
+  border-radius: ${t.radius.sm};
+  border: 1px solid ${({ $state }) => {
+    if ($state === "ready") return t.color.positive;
+    if ($state === "failed") return t.color.negative;
+    if ($state === "non_converged") return t.color.border;
+    if ($state === "running" || $state === "pending") return t.color.accent;
+    return t.color.border;
+  }};
+  background: ${({ $state }) => {
+    if ($state === "ready") return t.color.positiveBg;
+    if ($state === "failed") return t.color.negativeBg;
+    if ($state === "non_converged") return t.color.sunken;
+    if ($state === "running" || $state === "pending") return t.color.accentSub;
+    return t.color.sunken;
+  }};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${({ $state }) => {
+    if ($state === "ready") return t.color.positive;
+    if ($state === "failed") return t.color.negative;
+    if ($state === "non_converged") return t.color.ink3;
+    if ($state === "running" || $state === "pending") return t.color.accentInk;
+    return t.color.ink3;
+  }};
+  cursor: ${({ $clickable }) => ($clickable ? "pointer" : "default")};
+  white-space: nowrap;
+  transition: filter ${t.motion.base} ${t.motion.ease};
+  flex-shrink: 0;
+
+  &:hover {
+    filter: ${({ $clickable }) => ($clickable ? "brightness(0.96)" : "none")};
+  }
+`;
+
+const MmmChipDot = styled.span`
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: ${({ $state }) => {
+    if ($state === "ready") return t.color.positive;
+    if ($state === "failed") return t.color.negative;
+    if ($state === "non_converged") return t.color.ink4;
+    return t.color.accent;
+  }};
+  flex-shrink: 0;
+
+  ${({ $state }) =>
+    ($state === "running" || $state === "pending") &&
+    `
+    animation: mmmPulse 1.2s ease-in-out infinite;
+
+    @keyframes mmmPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.25); }
+    }
+  `}
+`;
+
+const MmmChipLabel = styled.span`
+  font-variant-numeric: tabular-nums;
 `;

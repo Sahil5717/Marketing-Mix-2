@@ -291,8 +291,105 @@ export async function ensureScenarioReady(view = "client", opts = {}) {
   return { data: null, error };
 }
 
-// ─── Analyst Tools Hub screen ───
+// ─── Market Context screen ───
 
+/**
+ * Fetch full market-context payload (events, trends, competitive).
+ */
+export async function fetchMarketContext() {
+  return apiRequest("/market-context");
+}
+
+/**
+ * Cold-start variant — ensures analysis has run, then fetches market
+ * context. Safe to call before any external data is uploaded; the
+ * backend returns empty sections with a helpful headline.
+ */
+export async function ensureMarketContextReady() {
+  const { data, error } = await fetchMarketContext();
+  if (data) return { data, error: null };
+  if (error && error.kind === "http" && error.status === 400) {
+    const mock = await loadMockData();
+    if (mock.error) return { data: null, error: mock.error };
+    const analysis = await runAnalysis();
+    if (analysis.error) return { data: null, error: analysis.error };
+    return await fetchMarketContext();
+  }
+  return { data: null, error };
+}
+
+// ─── Bayesian MMM ───
+
+/**
+ * Fetch the current Bayesian fit lifecycle state. Safe to poll.
+ * Returns { data: { state, started_at, finished_at, elapsed_s, r_hat_max,
+ * ess_min, n_channels, message }, error }.
+ *
+ * `state` is one of: "idle", "pending", "running", "ready", "failed",
+ * "non_converged". UI should show a spinner chip while pending/running,
+ * an error note for failed/non_converged, and live HDI data for ready.
+ */
+export async function fetchBayesStatus() {
+  return apiRequest("/bayes-status");
+}
+
+/**
+ * Fetch the full Bayesian fit result. Only succeeds when state=="ready".
+ * Returns { data: { method, contributions, model_diagnostics, ... }, error }.
+ *
+ * Each contribution carries: contribution, contribution_hdi_90,
+ * mmm_roas, mmm_roas_hdi_90, decay_mean, half_saturation, confidence.
+ */
+export async function fetchBayesResult() {
+  return apiRequest("/bayes-result");
+}
+
+/**
+ * Trigger a fresh Bayesian fit. No-op if one is already running.
+ */
+export async function refitBayes() {
+  return apiRequest("/bayes-refit", { method: "POST" });
+}
+
+// ─── Engagements ───
+
+/**
+ * List engagements. Returns { data: { engagements, active_engagement_id }, error }.
+ */
+export async function fetchEngagements() {
+  return apiRequest("/engagements");
+}
+
+/**
+ * Create an engagement. Payload: { client, engagement_name, period, status?, owner?, summary? }.
+ */
+export async function createEngagement(payload) {
+  return apiRequest("/engagements", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * Delete an engagement. Backend rejects deletion of the active one.
+ */
+export async function deleteEngagement(engagementId) {
+  return apiRequest(`/engagements/${encodeURIComponent(engagementId)}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Set an engagement as active.
+ */
+export async function activateEngagement(engagementId) {
+  return apiRequest(`/engagements/${encodeURIComponent(engagementId)}/activate`, {
+    method: "POST",
+  });
+}
+
+// ─── Analyst Tools Hub screen ───
 /**
  * Fetch the analyst-status payload: what data sources are loaded, how
  * many rows each, next-step hint, KPI stats for the dashboard cards.

@@ -180,6 +180,7 @@ export function Diagnosis({
                   subCopy={f.narrative}
                   impactLabel="Opportunity"
                   impactValue={formatImpact(f.impact_dollars)}
+                  recommendation={f.recommendation}
                   suppressed={f.suppressed}
                   editorMode={editorMode}
                   onEditNote={() => onCommentaryEdit?.(f)}
@@ -189,8 +190,9 @@ export function Diagnosis({
             </MainColumn>
 
             <Sidebar>
-              <EditorTakeCard data={data} />
+              <EditorTakeCard data={data} editorMode={editorMode} />
               <ConfidenceCard findings={visibleFindings} />
+              <MarketContextCard context={data.market_context} />
             </Sidebar>
           </TwoColumn>
         )}
@@ -221,10 +223,11 @@ export function Diagnosis({
  * the most visually distinctive element in the sidebar and earns the
  * terracotta tint.
  */
-function EditorTakeCard({ data }) {
+function EditorTakeCard({ data, editorMode = false, onAddCommentary }) {
   const findingWithCommentary = (data.findings || []).find((f) => f.ey_commentary);
   const analyst = data.analyst?.name || "Sarah Rahman";
 
+  // Case 1: An analyst has actually written commentary. Show it.
   if (findingWithCommentary) {
     return (
       <Callout label="Editor's Take" byline={`${analyst}, reviewing analyst`}>
@@ -233,16 +236,26 @@ function EditorTakeCard({ data }) {
     );
   }
 
-  // Fallback — synthesize from the top finding if no commentary exists.
-  // In the real product an analyst would author this; for the pitch we
-  // generate a reasonable default.
-  const topFinding = data.findings?.[0];
-  if (!topFinding) return null;
-  return (
-    <Callout label="Editor's Take" byline={`${analyst}, reviewing analyst`}>
-      {topFinding.narrative}
-    </Callout>
-  );
+  // Case 2: No commentary, editor mode. Prompt the editor to add one
+  // rather than fake a "take" by regurgitating finding metrics.
+  if (editorMode) {
+    const topFinding = data.findings?.[0];
+    if (!topFinding) return null;
+    return (
+      <EditorTakePrompt>
+        <EditorTakeLabel>Editor's take</EditorTakeLabel>
+        <EditorTakePromptCopy>
+          No commentary added yet. Click any finding's <strong>Add note</strong>
+          {" "}button to write the analyst's perspective — the first note added
+          will appear here for the client.
+        </EditorTakePromptCopy>
+      </EditorTakePrompt>
+    );
+  }
+
+  // Case 3: No commentary, client mode. Hide the card entirely rather
+  // than show auto-generated technical text that reads as gibberish.
+  return null;
 }
 
 /**
@@ -273,6 +286,119 @@ function ConfidenceCard({ findings }) {
       </RowList>
     </SidebarCard>
   );
+}
+
+/**
+ * MarketContextCard — surfaces external data (events, trends, competitive)
+ * that the analyst has uploaded. Even when external data doesn't yet
+ * feed into the MMM itself (full integration is planned for the Bayesian
+ * rebuild), this card makes visible that the data was received and
+ * provides the analyst/client with the signals it carries.
+ *
+ * Renders nothing if no external data has been loaded — we don't want
+ * a permanent empty card.
+ */
+function MarketContextCard({ context }) {
+  if (!context) return null;
+  const loaded = context.data_sources_loaded || [];
+  if (loaded.length === 0) return null;
+
+  const events = context.events || [];
+  const eventRecs = context.event_recommendations || [];
+  const trendAlerts = context.trends_alerts || [];
+  const compSnapshot = context.competitive_snapshot;
+
+  return (
+    <SidebarCard>
+      <SidebarLabel>Market context</SidebarLabel>
+
+      {/* Near-term recommendations get top billing — they're actionable */}
+      {eventRecs.length > 0 && (
+        <MCSection>
+          <MCSectionHead>Near-term action</MCSectionHead>
+          {eventRecs.slice(0, 2).map((r, i) => (
+            <MCAction key={i}>
+              <MCActionTitle>{r.action_summary || r.title}</MCActionTitle>
+              {r.narrative && (
+                <MCActionBody>{truncate(r.narrative, 180)}</MCActionBody>
+              )}
+            </MCAction>
+          ))}
+        </MCSection>
+      )}
+
+      {/* Upcoming events — full horizon, not just 90-day window */}
+      {events.length > 0 && (
+        <MCSection>
+          <MCSectionHead>Upcoming events ({events.length})</MCSectionHead>
+          <MCEventList>
+            {events.slice(0, 5).map((e, i) => (
+              <MCEventRow key={i}>
+                <MCEventDot $direction={e.direction} />
+                <MCEventBody>
+                  <MCEventName>{e.name}</MCEventName>
+                  <MCEventMeta>
+                    {formatDaysAway(e.days_away)}
+                    {e.impact_pct != null && e.direction && (
+                      <>
+                        <MCDot>·</MCDot>
+                        <MCEventImpact $direction={e.direction}>
+                          {e.direction === "positive" ? "+" : ""}{e.impact_pct}% expected
+                        </MCEventImpact>
+                      </>
+                    )}
+                  </MCEventMeta>
+                </MCEventBody>
+              </MCEventRow>
+            ))}
+          </MCEventList>
+        </MCSection>
+      )}
+
+      {/* Trend alerts — CPC inflation, CPM shifts */}
+      {trendAlerts.length > 0 && (
+        <MCSection>
+          <MCSectionHead>Trend alerts</MCSectionHead>
+          {trendAlerts.slice(0, 2).map((a, i) => (
+            <MCAction key={i}>
+              <MCActionTitle>{a.title}</MCActionTitle>
+              {a.narrative && (
+                <MCActionBody>{truncate(a.narrative, 180)}</MCActionBody>
+              )}
+            </MCAction>
+          ))}
+        </MCSection>
+      )}
+
+      {/* Competitive snapshot */}
+      {compSnapshot && compSnapshot.narrative && (
+        <MCSection>
+          <MCSectionHead>Competitive</MCSectionHead>
+          <MCActionBody>{compSnapshot.narrative}</MCActionBody>
+        </MCSection>
+      )}
+
+      <MCFooter>
+        Context loaded: {loaded.join(", ")}
+      </MCFooter>
+    </SidebarCard>
+  );
+}
+
+function formatDaysAway(days) {
+  if (days == null) return "";
+  if (days < 0) return `${Math.abs(days)}d ago`;
+  if (days === 0) return "Today";
+  if (days < 7) return `In ${days}d`;
+  if (days < 35) return `In ${Math.round(days / 7)}w`;
+  if (days < 365) return `In ${Math.round(days / 30)} months`;
+  return `In ${Math.round(days / 365)}y`;
+}
+
+function truncate(s, n) {
+  if (!s) return "";
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1).trimEnd() + "…";
 }
 
 function DataAssumptionsPane({ data }) {
@@ -521,4 +647,158 @@ const PaneList = styled.ul`
   strong {
     font-weight: ${t.weight.semibold};
   }
+`;
+
+// ─── Editor's take prompt (empty state in editor mode) ───
+
+const EditorTakePrompt = styled.div`
+  padding: ${t.space[4]} ${t.space[5]};
+  background: ${t.color.surface};
+  border: 1px dashed ${t.color.border};
+  border-radius: ${t.radius.md};
+`;
+
+const EditorTakeLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const EditorTakePromptCopy = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+
+  strong {
+    color: ${t.color.ink};
+    font-weight: ${t.weight.semibold};
+  }
+`;
+
+// ─── Market context sidebar card ───
+
+const MCSection = styled.div`
+  padding-top: ${t.space[3]};
+  margin-top: ${t.space[3]};
+  border-top: 1px solid ${t.color.borderFaint};
+
+  &:first-of-type {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+  }
+`;
+
+const MCSectionHead = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const MCAction = styled.div`
+  margin-bottom: ${t.space[3]};
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+`;
+
+const MCActionTitle = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink};
+  line-height: ${t.leading.normal};
+  margin-bottom: ${t.space[1]};
+`;
+
+const MCActionBody = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+`;
+
+const MCEventList = styled.ul`
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: ${t.space[2]};
+`;
+
+const MCEventRow = styled.li`
+  display: flex;
+  align-items: flex-start;
+  gap: ${t.space[2]};
+`;
+
+const MCEventDot = styled.span`
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 6px;
+  background: ${({ $direction }) =>
+    $direction === "positive" ? t.color.positive :
+    $direction === "negative" ? t.color.negative :
+    t.color.ink4};
+  flex-shrink: 0;
+`;
+
+const MCEventBody = styled.div`
+  flex: 1;
+  min-width: 0;
+`;
+
+const MCEventName = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink};
+  line-height: ${t.leading.normal};
+`;
+
+const MCEventMeta = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[1]};
+  flex-wrap: wrap;
+`;
+
+const MCEventImpact = styled.span`
+  color: ${({ $direction }) =>
+    $direction === "positive" ? t.color.positive :
+    $direction === "negative" ? t.color.negative :
+    t.color.ink3};
+  font-weight: ${t.weight.medium};
+`;
+
+const MCDot = styled.span`
+  color: ${t.color.ink4};
+`;
+
+const MCFooter = styled.div`
+  margin-top: ${t.space[3]};
+  padding-top: ${t.space[3]};
+  border-top: 1px solid ${t.color.borderFaint};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
 `;

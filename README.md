@@ -1,130 +1,132 @@
-# Yield Intelligence Platform
-## Marketing ROI & Budget Optimization Engine
+# MarketLens
 
-### What it does
-Omnichannel marketing analytics engine that answers three questions:
-1. **What happened?** — ROI, attribution, trends across all channels and campaigns
-2. **What should we do?** — AI-backed recommendations with QoQ/YoY context, cross-channel reasoning, phased action plans
-3. **What's the business case?** — Budget optimization with scenario comparison, value-at-risk quantification
+**Marketing ROI analytics for consulting engagements.**
+Built for the analyst desk that sits between a CMO's questions and the plan a CFO will sign.
 
-### Architecture
-- **Backend**: FastAPI (Python 3.12) with 20+ statistical engines (scipy, statsmodels, prophet, pymc)
-- **Frontend**: React + Recharts + Lucide (Vite build system, CDN fallback for portability)
+---
+
+## What it does
+
+MarketLens answers three questions every marketing review ends up asking:
+
+1. **Where is value leaking today?** — diagnosis across channels with attribution, response curves, and value-at-risk quantification.
+2. **What should we do about it?** — phased reallocation plan with honest lead times, per-channel execution constraints, and a calendar the client can actually execute against.
+3. **How confident are you?** — Bayesian MMM credible intervals alongside frequentist point estimates, surfaced wherever a number is shown.
+
+## Who it's for
+
+Designed for **consulting analysts** preparing marketing effectiveness deliverables, and their **CMO/CFO audience** consuming those deliverables in a meeting room. Two surfaces:
+
+- **Editor mode** (`/editor`) — for the analyst: data uploads, engagement management, suppressions, custom commentary, model diagnostics
+- **Client mode** (`/`) — for the CXO: the polished read-out, with the analyst's edits applied
+
+## Architecture
+
+- **Backend**: FastAPI (Python 3.12)
+- **Frontend**: React + Vite, styled-components, Recharts
 - **Persistence**: SQLite (sessions, scenarios, users)
-- **Auth**: JWT + RBAC (admin / analyst / viewer roles)
+- **Auth**: JWT + RBAC (editor / client / admin roles)
+- **Deployment**: Railway via Docker; cold-start ~90s including PyMC compilation
 
-### Key Features
+## Analysis engines
 
-**Analytics Engines (22 engines, 4,230 lines)**
-- Response Curves: Power-Law, Hill Saturation, Auto-select per channel
-- Marketing Mix Model: Bayesian (PyMC), MLE (scipy), OLS + Bootstrap, 3-tier fallback
-- Attribution: Last Touch, Linear, Position-Based, Markov Chain, Shapley Values
-- Optimizer: SLSQP constrained, Multi-Objective Pareto, sensitivity analysis
-- Forecasting: Prophet, ARIMA, linear fallback
-- Plus: adstock, cross-channel correlation, geo-lift, funnel analysis, trend analysis
+**Response curves**
+- Power-law and Hill saturation fits per channel, auto-selected by R²
+- Offline-aware: reach-based channels (TV, radio, OOH) fit a secondary diagnostic curve on the underlying primary metric (GRPs, reach)
+- Leave-one-out cross-validation, near-linear fit detection, confidence tiering
 
-**Model Control Panel**
-- All models selectable with real names (Bayesian PyMC NUTS, Markov Chain, SLSQP, etc.)
-- Diagnostic metrics visible (R², convergence, MAPE)
-- Auto-runs full engine chain when model selection changes
+**Marketing Mix Model**
+- **Bayesian** primary path: PyMC NUTS with adstock + Hill saturation priors, 300 draws × 2 chains, convergence checked at r-hat < 1.05
+- **MLE** fallback when Bayesian fails to converge
+- **OLS** final fallback
+- Credible intervals flow through to the UI: 80% HDI on ROAS, response curves, and plan deltas
 
-**Smart Recommendations (13+ types)**
-- Paragraph-style with historical context and QoQ/YoY trends
-- Cross-channel reasoning: "Shift $45K/month from Display to Paid Search"
-- Phased plans: Month 1 test, Month 2-3 scale, conditions for scaling
-- Model provenance: "Source: Response Curves + Markov Attribution"
-- Types: REALLOCATE, DECLINING, FIX_CX, HIDDEN_VALUE, SCALE, REDUCE, FIX, RETARGET, MAINTAIN
+**Optimizer**
+- SLSQP constrained per-channel with realistic execution constraints:
+  - TV: ±35% swing cap, 8-week lead time, $500K annual floor
+  - Events: ±30% swing, 12-week lead time (trade show commitments)
+  - Radio/OOH/Call center: channel-specific swing caps and lead times
+  - Digital: no swing cap, 1-week lead time
+- Multi-start initialization, trust-constr fallback when SLSQP fails
+- Sensitivity analysis with deterministic seeding
 
-**External Data Integration (3 CSV uploads)**
-- Competitive Intelligence (SEMrush/SimilarWeb exports) → DEFEND, OPPORTUNITY, DIFFERENTIATE
-- Market Events (seasonal calendar, competitor actions) → PREPARE, MITIGATE, CAPITALIZE
-- Market Trends (CPC/CPM trends, benchmarks) → BENCHMARK, COST_ALERT
+**Attribution**
+- Last-touch, linear, position-based, Markov chain
 
-**Infrastructure**
-- SQLite persistence (sessions survive restarts)
-- JWT authentication with 3 roles (admin, analyst, viewer)
-- Scenario save/load/compare (side-by-side with channel-level diffs)
-- Vite build system (180KB gzipped production bundle)
-- Docker deployment (Railway/Render ready)
+**External data**
+- Competitive intelligence (SEMrush/SimilarWeb schema)
+- Market events (seasonal calendar, competitor actions)
+- Cost trends (CPC/CPM trajectories)
+- Surfaced as honest diagnostics (Market Context screen); structured-prior integration into the MMM deferred
 
-### Quick Start
+## Demo credentials
+
+Four seeded users, all password `demo1234`:
+
+| Username       | Role   | Intended use                     |
+|----------------|--------|----------------------------------|
+| ey.partner     | admin  | Full access, all override powers |
+| ey.analyst     | editor | Analyst desk — prepare engagements |
+| client.cmo     | viewer | Client CXO view                  |
+| client.analyst | viewer | Client analyst view              |
+
+## Screens
+
+**Editor mode** (`/editor`):
+- **Engagements** — list of consulting projects, active-engagement tracking, add/delete
+- **Workspace** — data upload hub (5 CSV types), model controls, run-analysis trigger
+- **Diagnosis** — what happened, with findings paired to recommendations
+- **Plan** — what to do: Moves, Tradeoffs, Roadmap Gantt, Compare models (Bayesian vs frequentist)
+- **Scenarios** — budget-sweep comparison
+- **Channels** — per-channel deep-dive with response curves, Bayesian HDI band, campaigns table
+- **Market** — external data: events, cost trends, competitive SOV
+
+**Client mode** (`/`): Same screens minus upload controls and suppression tooling. Analyst overrides and commentary are visible as applied; no edit surface.
+
+## Quick start (local)
 
 ```bash
 # Backend
 cd backend
 pip install -r requirements.txt
-uvicorn api:app --reload --port 8000
+JWT_SECRET=your-dev-secret uvicorn api:app --reload
 
-# Frontend (development)
+# Frontend (separate terminal)
 cd frontend
 npm install
-npm run dev
-
-# Frontend (production build)
-cd frontend
 npm run build
-# Serves from /app endpoint on backend
+# Served statically by FastAPI at http://localhost:8000/editor
 ```
 
-### API Endpoints (40+)
+## Deploy (Railway)
 
-| Category | Endpoints |
-|----------|-----------|
-| Core | `/api/health`, `/api/load-mock-data`, `/api/full-state` |
-| Upload | `/api/upload`, `/api/upload-journeys`, `/api/upload-competitive`, `/api/upload-events`, `/api/upload-trends` |
-| Analysis | `/api/response-curves`, `/api/recommendations`, `/api/pillars`, `/api/insights` |
-| Models | `/api/model-selections`, `/api/mmm`, `/api/adstock`, `/api/markov-attribution`, `/api/shapley` |
-| Optimization | `/api/optimize`, `/api/sensitivity`, `/api/multi-objective` |
-| Intelligence | `/api/trend-analysis`, `/api/funnel-analysis`, `/api/forecast`, `/api/cross-channel` |
-| Auth | `/api/auth/register`, `/api/auth/login`, `/api/auth/me` |
-| Scenarios | `/api/scenarios`, `/api/scenarios/save`, `/api/scenarios/compare` |
-| Export | `/api/executive-summary`, `/api/download-template` |
+`railway.toml` + `Dockerfile` handle the full build chain including PyMC's C-extension compilation. Required environment variable: `JWT_SECRET` (default is dev-only).
 
-### Honest Limitations
-- Frontend is React via CDN (Vite build available but not served by default from backend)
-- SQLite is single-file, not horizontally scalable (PostgreSQL recommended for teams)
-- MMM Bayesian path needs PyMC which requires specific system libraries
-- Mock data is synthetic — response curves will differ with real campaign data
-- In-browser Babel fallback still used when Vite dist is not deployed
-- Auth is basic JWT — no OAuth, no SSO, no MFA
-- Scenario comparison is parameter-level, not visual diff
+Demo users auto-seed on every boot — safe for Railway's ephemeral SQLite.
 
-### File Structure
-```
-yield-intelligence/
-├── backend/
-│   ├── api.py                    # FastAPI — 40+ endpoints
-│   ├── auth.py                   # JWT + RBAC
-│   ├── persistence.py            # SQLite state management
-│   ├── mock_data.py              # 48-month demo data
-│   ├── validator.py              # Upload validation
-│   ├── test_integration.py       # 69-test suite
-│   └── engines/                  # 22 statistical engines
-│       ├── response_curves.py    # Power-Law, Hill, Auto
-│       ├── optimizer.py          # SLSQP, sensitivity
-│       ├── mmm.py                # Bayesian, MLE, OLS
-│       ├── insights.py           # Smart recommendations + QoQ/YoY
-│       ├── external_data.py      # Competitive, Events, Trends
-│       ├── attribution.py        # Last Touch, Linear, Position-Based
-│       ├── markov_attribution.py # Markov Chain + bootstrap
-│       ├── diagnostics.py        # Statistical recommendations
-│       ├── leakage.py            # Value at Risk (3 pillars)
-│       ├── forecasting.py        # Prophet, ARIMA
-│       └── ...                   # 12 more engines
-├── frontend/
-│   ├── app.jsx                   # React frontend (7 screens)
-│   ├── index.html                # CDN fallback entry
-│   ├── main.jsx                  # Vite entry
-│   ├── vite.config.js            # Vite build config
-│   └── package.json              # Node dependencies
-├── templates/                    # 5 CSV upload templates
-├── docs/                         # Model specs, data dictionary, blueprints
-├── Dockerfile                    # Production container
-└── README.md
-```
+## Testing
 
-### Tests
-```bash
-cd backend && python test_integration.py
-# Expected: 69 passed, 0 failed
-```
+- `test_integration.py` — 69 tests, full analysis pipeline
+- `test_mmm_correctness.py` — 18 tests, MLE MMM correctness
+- `test_optimizer_correctness.py` — 20 tests, constrained optimization
+- `test_bayes_fast.py` — 44 tests, Bayesian HDI structure (~3 min, runs separately)
+
+151 tests green as of v22. Run via `python test_integration.py` from the `backend/` directory.
+
+## Project scope — honest version
+
+This is a **pitch asset** — polished enough to demonstrate the product vision to an EY buyer, realistic enough to survive probing questions. It is not a production multi-tenant SaaS.
+
+- **Engagements are shared-state in-memory** — switching active engagement is a UI affordance; the underlying data is the same mock dataset
+- **Mock data is seeded** — 12 channels, 34 campaigns, 48 months, ~6,500 campaign rows + ~15,000 journey rows. Client CSV uploads are supported but the demo runs on mocks.
+- **Roadmap is read-only** — drag-edit + per-user persistence deferred
+
+What IS real: the math. Response curves actually fit, the optimizer actually converges under realistic constraints, Bayesian MMM actually samples via PyMC NUTS, credible intervals are derived from real posterior draws (not beta-CI approximations). A CMO can ask "what's your methodology?" and get a substantive answer.
+
+## Changes
+
+See `CHANGES.md` — full version history from v18 through v22.
+
+## License
+
+See `LICENSE`.

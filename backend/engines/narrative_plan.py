@@ -151,7 +151,11 @@ def generate_move_narrative(move: Dict, action: str) -> str:
         )
 
 
-def build_moves(opt_channels: List[Dict], curves: Optional[Dict] = None) -> List[Dict]:
+def build_moves(
+    opt_channels: List[Dict],
+    curves: Optional[Dict] = None,
+    bayes_result: Optional[Dict] = None,
+) -> List[Dict]:
     """
     Convert the optimizer's per-channel output into ranked move cards.
 
@@ -167,8 +171,16 @@ def build_moves(opt_channels: List[Dict], curves: Optional[Dict] = None) -> List
     these moves so the UI can render them with an "inconclusive
     saturation" warning rather than presenting $7.7M of fabricated
     uplift as reliable.
+
+    The `bayes_result` parameter (when present) is used to attach an 80%
+    credible region to each move's revenue delta for channels in the
+    Bayesian subset. This lets the UI show "+$5.2M (HDI +$2.1M to +$7.8M)"
+    honestly — the frequentist point estimate with the Bayesian uncertainty
+    range around it. Graceful degradation: moves for channels NOT in the
+    Bayesian subset render without HDI (frequentist-only).
     """
     curves = curves or {}
+    bayes_contribs = ((bayes_result or {}).get("contributions") or {}) if bayes_result else {}
     moves = []
     for ch in opt_channels:
         change_pct = ch.get("change_pct", 0) or 0
@@ -184,6 +196,36 @@ def build_moves(opt_channels: List[Dict], curves: Optional[Dict] = None) -> List
         # is an extrapolation past what the data supports; the UI must
         # communicate this alongside the number.
         near_linear = bool(curves.get(channel, {}).get("near_linear_fit", False))
+
+        # Bayesian delta range: for channels in the Bayesian subset, estimate
+        # an 80% credible interval around the revenue impact of this move.
+        # Uses ROAS HDI × spend_delta as a first-order approximation.
+        #
+        # Honest framing: the Bayesian model is separate from the frequentist
+        # one, so the interval isn't "uncertainty on the frequentist estimate"
+        # — it's the Bayesian model's own best guess of the delta with 80%
+        # credible region. The width reflects Bayesian-model uncertainty.
+        bayes_delta_hdi = None
+        bayes_delta_point = None
+        bayes_roas_hdi = None
+        bayes_roas_point = None
+        bc = bayes_contribs.get(channel)
+        if bc is not None:
+            roas_hdi = bc.get("mmm_roas_hdi_90") or []
+            roas_point = bc.get("mmm_roas")
+            if len(roas_hdi) == 2 and roas_point is not None:
+                # For an increase, revenue gained = spend_delta × ROAS
+                # For a decrease, revenue lost = spend_delta × ROAS (spend_delta is negative)
+                # HDI multiplication: lo_roas × spend_delta and hi_roas × spend_delta
+                # give the interval endpoints, but we must keep them ordered.
+                d_lo = float(roas_hdi[0]) * float(spend_delta)
+                d_hi = float(roas_hdi[1]) * float(spend_delta)
+                if d_lo > d_hi:
+                    d_lo, d_hi = d_hi, d_lo
+                bayes_delta_hdi = [round(d_lo, 0), round(d_hi, 0)]
+                bayes_delta_point = round(float(roas_point) * float(spend_delta), 0)
+                bayes_roas_hdi = [round(float(roas_hdi[0]), 2), round(float(roas_hdi[1]), 2)]
+                bayes_roas_point = round(float(roas_point), 2)
 
         # Action verb + channel name for headline. Kept consistent with
         # how Diagnosis findings phrase prescriptions (verb-first clarity).
@@ -221,6 +263,18 @@ def build_moves(opt_channels: List[Dict], curves: Optional[Dict] = None) -> List
             "locked": bool(ch.get("locked", False)),
             "reliability": "inconclusive" if near_linear else "reliable",
             "near_linear_fit": near_linear,
+            # Execution constraints (lead time, swing cap, min floor) from
+            # the optimizer. Offline channels have non-null values that
+            # the UI surfaces as honest timing/floor notes.
+            "constraints": ch.get("constraints") or {},
+            # Bayesian revenue delta HDI (80% credible region), None when
+            # the channel isn't in the Bayesian subset or the fit isn't
+            # ready yet. UI shows a range badge when present, nothing when
+            # not — never a misleading zero-width interval.
+            "bayes_delta_hdi_90": bayes_delta_hdi,
+            "bayes_delta_point": bayes_delta_point,
+            "bayes_roas_hdi_90": bayes_roas_hdi,
+            "bayes_roas_point": bayes_roas_point,
             # Used by the dedupe/rank
             "_rank": -abs(revenue_delta),
         })
@@ -550,6 +604,7 @@ def generate_plan(
     response_curves: Dict,
     engagement_id: str = "default",
     view: str = "client",
+    bayes_result: Optional[Dict] = None,
 ) -> Dict:
     """
     Top-level assembly. Produces the full Plan screen payload.
@@ -557,13 +612,16 @@ def generate_plan(
     Mirror of generate_diagnosis() in engines/narrative.py — same view
     semantics ("client" filters suppressions, "editor" returns everything
     with flags), same override layering, same metadata shape.
+
+    `bayes_result` (optional) attaches Bayesian credible intervals to
+    moves for channels in the Bayesian subset. Safe to pass None.
     """
     if not optimization or "channels" not in optimization:
         return _empty_plan(engagement_id, view)
 
     summary = optimization.get("summary", {}) or {}
     opt_info = optimization.get("optimizer_info", {}) or {}
-    moves = build_moves(optimization["channels"], curves=response_curves)
+    moves = build_moves(optimization["channels"], curves=response_curves, bayes_result=bayes_result)
 
     # Layer editor overrides the same way generate_diagnosis does
     overrides = _load_overrides_safely(engagement_id)

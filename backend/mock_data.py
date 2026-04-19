@@ -18,14 +18,38 @@ np.random.seed(42)
 # --- Channel & Campaign Definitions ---
 
 CHANNELS = {
-    "paid_search": {"type": "online", "base_cpc": 2.5, "base_cvr": 0.035, "saturation_point": 150000},
-    "organic_search": {"type": "online", "base_cpc": 0, "base_cvr": 0.042, "saturation_point": None},
-    "social_paid": {"type": "online", "base_cpc": 1.8, "base_cvr": 0.018, "saturation_point": 120000},
-    "display": {"type": "online", "base_cpc": 0.9, "base_cvr": 0.008, "saturation_point": 80000},
-    "email": {"type": "online", "base_cpc": 0.15, "base_cvr": 0.055, "saturation_point": 40000},
-    "video_youtube": {"type": "online", "base_cpc": 3.2, "base_cvr": 0.012, "saturation_point": 100000},
-    "events": {"type": "offline", "base_cpc": 45, "base_cvr": 0.08, "saturation_point": 200000},
-    "direct_mail": {"type": "offline", "base_cpc": 5.5, "base_cvr": 0.025, "saturation_point": 60000},
+    "paid_search":    {"type": "online",  "base_cpc": 2.5,  "base_cvr": 0.035, "saturation_point": 150000,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    "organic_search": {"type": "online",  "base_cpc": 0,    "base_cvr": 0.042, "saturation_point": None,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    "social_paid":    {"type": "online",  "base_cpc": 1.8,  "base_cvr": 0.018, "saturation_point": 120000,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    "display":        {"type": "online",  "base_cpc": 0.9,  "base_cvr": 0.008, "saturation_point": 80000,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    "email":          {"type": "online",  "base_cpc": 0.15, "base_cvr": 0.055, "saturation_point": 40000,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    "video_youtube":  {"type": "online",  "base_cpc": 3.2,  "base_cvr": 0.012, "saturation_point": 100000,
+                       "attribution_basis": "click",    "primary_metric": "clicks"},
+    # Direct-response offline — has a native conversion signal (event attendees,
+    # dealer enquiries from mailers). No clicks but a strong funnel proxy.
+    "events":      {"type": "offline", "base_cpc": 45,  "base_cvr": 0.08,  "saturation_point": 200000,
+                    "attribution_basis": "direct_response", "primary_metric": "event_attendees"},
+    "direct_mail": {"type": "offline", "base_cpc": 5.5, "base_cvr": 0.025, "saturation_point": 60000,
+                    "attribution_basis": "direct_response", "primary_metric": "dealer_enquiries"},
+    # Broadcast offline — reach-based, no clicks. GRPs are the primary unit.
+    # Saturation is structural (you can't reach >100% of population) AND
+    # diminishing (the 4th exposure to a viewer is much less effective than
+    # the 1st). Saturation point here is in spend terms for the power-law
+    # funnel — the real reach-basis curve is in engines/response_curves.
+    "tv_national": {"type": "offline", "base_cpc": 0, "base_cvr": 0.004, "saturation_point": 400000,
+                    "attribution_basis": "reach", "primary_metric": "grps"},
+    "radio":       {"type": "offline", "base_cpc": 0, "base_cvr": 0.003, "saturation_point": 90000,
+                    "attribution_basis": "reach", "primary_metric": "grps"},
+    "ooh":         {"type": "offline", "base_cpc": 0, "base_cvr": 0.002, "saturation_point": 150000,
+                    "attribution_basis": "reach", "primary_metric": "reach"},
+    # Direct-response offline — inbound calls for a call_center.
+    "call_center": {"type": "offline", "base_cpc": 0, "base_cvr": 0.035, "saturation_point": 80000,
+                    "attribution_basis": "direct_response", "primary_metric": "calls_generated"},
 }
 
 
@@ -55,6 +79,14 @@ TARGET_CHANNEL_MIX = {
     "video_youtube":  {"target_roas": 2.5},
     "events":         {"target_roas": 3.0},
     "direct_mail":    {"target_roas": 3.0},
+    # Offline broadcast — weaker ROAS is realistic; these are brand/awareness
+    # channels with indirect attribution paths. Client expects to justify
+    # them on reach and halo, not short-term ROAS alone.
+    "tv_national":    {"target_roas": 2.0},
+    "radio":          {"target_roas": 2.4},
+    "ooh":            {"target_roas": 1.8},
+    # Call center — direct response, higher ROAS than broadcast
+    "call_center":    {"target_roas": 4.0},
 }
 
 
@@ -74,6 +106,13 @@ BASELINE_UNCALIBRATED_ROAS = {
     "video_youtube":  0.11,
     "events":         125.0,
     "direct_mail":    2.1,
+    # Measured values for new offline channels from a first generation run
+    # with the current parameters. Updating here makes the calibration
+    # multiplier produce on-target ROAS.
+    "tv_national":    0.51,
+    "radio":          0.45,
+    "ooh":            0.09,
+    "call_center":    103.71,
 }
 
 
@@ -101,6 +140,12 @@ CAMPAIGNS_PER_CHANNEL = {
     "video_youtube": ["YT_PreRoll", "YT_Discovery", "YT_Shorts"],
     "events": ["Events_TradeShow", "Events_Webinar", "Events_Conference"],
     "direct_mail": ["DM_Catalog", "DM_PostCard"],
+    # Broadcast offline — a small number of large campaigns (networks, stations)
+    "tv_national": ["TV_Primetime", "TV_Daytime", "TV_Sports"],
+    "radio":       ["Radio_Morning", "Radio_Evening"],
+    "ooh":         ["OOH_Billboards", "OOH_Transit"],
+    # Call center — inbound response programs tied to other media
+    "call_center": ["CC_InboundSales", "CC_Retention"],
 }
 
 REGIONS = ["North", "South", "East", "West"]
@@ -218,6 +263,50 @@ CHANNEL_PATTERNS: Dict[str, dict] = {
         "noise_pct": 0.12,
         "flight_months": [1, 2, 3, 5, 6, 7],  # only active Aug-Dec and Jan/Apr
         "spike_months": [],
+    },
+    # TV is classic flighted buying — big Q4 holiday push, big spring launch
+    # window, mostly dark in summer.
+    "tv_national": {
+        "phase_shift": 10,  # peak in Nov
+        "amplitude": 0.60,
+        "base_trend_yr": -0.04,  # slowly shifting to digital
+        "noise_pct": 0.18,  # offline buys are lumpier than digital
+        "flight_months": [6, 7],  # dark Jul-Aug
+        "spike_months": [
+            (2022, 10), (2023, 10), (2024, 10), (2025, 10),  # annual Q4 push
+            (2023, 3), (2024, 3),  # spring launches
+        ],
+    },
+    "radio": {
+        # Drive-time buys that correlate with retail promotions
+        "phase_shift": 9,  # peak in Oct
+        "amplitude": 0.45,
+        "base_trend_yr": -0.06,
+        "noise_pct": 0.15,
+        "flight_months": [6, 7],
+        "spike_months": [(2022, 10), (2023, 10), (2024, 10), (2025, 10)],
+    },
+    "ooh": {
+        # Quarterly billboard/transit creative refresh. Steady-ish but dark
+        # in periods without active creative.
+        "phase_shift": 5,  # peak in Jun
+        "amplitude": 0.35,
+        "base_trend_yr": 0.02,  # modest growth (programmatic OOH)
+        "noise_pct": 0.20,
+        "flight_months": [0, 1],  # quiet Jan-Feb
+        "spike_months": [(2023, 5), (2024, 5), (2025, 5)],
+    },
+    # Call center scales with other channels' lead flow — its "spikes" mirror
+    # paid search and direct mail peak months.
+    "call_center": {
+        "phase_shift": 10,  # peak in Nov
+        "amplitude": 0.30,
+        "base_trend_yr": 0.03,
+        "noise_pct": 0.10,
+        "flight_months": [],  # always-on
+        "spike_months": [
+            (2022, 11), (2023, 11), (2024, 11), (2025, 11),
+        ],
     },
 }
 
@@ -337,24 +426,66 @@ def generate_campaign_performance() -> pd.DataFrame:
                     # all funnel counts (clicks, leads, conversions) — only
                     # the final revenue is scaled.
                     revenue = revenue * _channel_revenue_calibration(channel_name)
-                    
+
+                    # Offline-specific metrics. For digital channels these
+                    # are 0 (the column exists for schema stability, but the
+                    # data is not meaningful). For offline channels, compute
+                    # based on spend and channel basis:
+                    #   - TV/radio: GRPs (gross rating points); 1 GRP ≈ 1%
+                    #     of target audience reached once. Buying power varies
+                    #     by daypart and network; rough rule: $400-$1000 per GRP.
+                    #   - OOH: reach — number of unique people passing the
+                    #     location/transit line in the month; store_visits
+                    #     as a direct offline response signal.
+                    #   - Events: attendees — direct count.
+                    #   - Direct mail: dealer_enquiries — inbound inquiries
+                    #     from mailer recipients.
+                    #   - Call center: calls_generated — inbound calls handled.
+                    grps = 0.0
+                    reach = 0.0
+                    store_visits = 0.0
+                    calls_generated = 0.0
+                    event_attendees = 0.0
+                    dealer_enquiries = 0.0
+
+                    if channel_name == "tv_national":
+                        grps = _add_noise(monthly_spend / 800, 0.15)
+                        reach = _add_noise(min(grps * 1_000_000 * 0.008, 50_000_000), 0.10)
+                    elif channel_name == "radio":
+                        grps = _add_noise(monthly_spend / 400, 0.18)
+                        reach = _add_noise(min(grps * 1_000_000 * 0.006, 30_000_000), 0.12)
+                    elif channel_name == "ooh":
+                        reach = _add_noise(monthly_spend / 0.80, 0.20)
+                        store_visits = _add_noise(reach * 0.002, 0.25)
+                    elif channel_name == "call_center":
+                        calls_generated = _add_noise(monthly_spend / 18, 0.10)
+                    elif channel_name == "events":
+                        event_attendees = _add_noise(monthly_spend / 120, 0.20)
+                    elif channel_name == "direct_mail":
+                        pieces_mailed = monthly_spend / 0.50
+                        dealer_enquiries = _add_noise(pieces_mailed * 0.008, 0.15)
+
                     # CX signals
                     bounce_rate = _get_bounce_rate(channel_name, campaign)
                     avg_session_duration = _add_noise(_get_session_duration(channel_name), 0.2)
                     form_completion_rate = _add_noise(_get_form_rate(channel_name, campaign), 0.1)
                     unsubscribe_rate = _get_unsub_rate(channel_name) if channel_name == "email" else 0
                     nps = _add_noise(_get_nps(channel_name), 0.05)
-                    
+
                     # Confidence tier
                     confidence = "High" if channel_props["type"] == "online" else "Medium"
-                    if channel_name in ("events", "direct_mail"):
+                    if channel_name in ("events", "direct_mail", "tv_national", "radio", "ooh", "call_center"):
                         confidence = "Model-Estimated"
-                    
+
                     rows.append({
                         "date": month,
                         "month": month.strftime("%Y-%m"),
                         "channel": channel_name,
                         "channel_type": channel_props["type"],
+                        # New taxonomy columns — every downstream engine that
+                        # cares about offline handling reads these.
+                        "attribution_basis": channel_props.get("attribution_basis", "click"),
+                        "primary_metric": channel_props.get("primary_metric", "clicks"),
                         "campaign": campaign,
                         "region": region,
                         "product": np.random.choice(PRODUCTS, p=[0.45, 0.35, 0.20]),
@@ -372,6 +503,14 @@ def generate_campaign_performance() -> pd.DataFrame:
                         "unsubscribe_rate": round(min(0.1, max(0, unsubscribe_rate)), 4),
                         "nps_score": round(min(100, max(-100, nps)), 1),
                         "confidence_tier": confidence,
+                        # Offline-specific. Zero for digital channels; populated
+                        # for the offline channels that use each metric.
+                        "grps": round(max(0, grps), 2),
+                        "reach": int(max(0, reach)),
+                        "store_visits": int(max(0, store_visits)),
+                        "calls_generated": int(max(0, calls_generated)),
+                        "event_attendees": int(max(0, event_attendees)),
+                        "dealer_enquiries": int(max(0, dealer_enquiries)),
                     })
     
     return pd.DataFrame(rows)
@@ -441,6 +580,10 @@ def _get_base_spend(channel: str, campaign: str) -> float:
         "paid_search": 35000, "social_paid": 28000, "display": 18000,
         "email": 5000, "video_youtube": 22000, "events": 45000, "direct_mail": 15000,
         "organic_search": 2000,
+        # Offline broadcast — large per-buy spends
+        "tv_national": 85000, "radio": 22000, "ooh": 35000,
+        # Call center — operational cost, moderate scale
+        "call_center": 18000,
     }
     # Vary by campaign within channel
     campaign_mult = 0.6 + hash(campaign) % 100 / 100 * 0.8
@@ -450,32 +593,56 @@ def _get_base_spend(channel: str, campaign: str) -> float:
 def _get_impression_mult(channel: str) -> float:
     return {"paid_search": 8, "organic_search": 12, "social_paid": 15,
             "display": 25, "email": 3, "video_youtube": 10,
-            "events": 0.5, "direct_mail": 0.8}.get(channel, 5)
+            "events": 0.5, "direct_mail": 0.8,
+            # Offline: we still compute an "impressions" equivalent for
+            # reporting parity — for TV/radio/OOH this is essentially
+            # reach × frequency. Large multipliers reflect mass reach.
+            "tv_national": 60, "radio": 45, "ooh": 80,
+            "call_center": 0.3}.get(channel, 5)
 
 
 def _get_ctr(channel: str, campaign: str) -> float:
+    # For offline channels, "CTR" is a proxy — it's the rate at which
+    # an impression produces some measurable engagement (a call, a visit).
+    # Kept small because mass-reach impressions don't individually drive
+    # action — they build brand awareness that pays off through other channels.
     base = {"paid_search": 0.045, "organic_search": 0.035, "social_paid": 0.012,
             "display": 0.004, "email": 0.22, "video_youtube": 0.008,
-            "events": 0.5, "direct_mail": 0.15}.get(channel, 0.02)
+            "events": 0.5, "direct_mail": 0.15,
+            "tv_national": 0.0015, "radio": 0.0025, "ooh": 0.0008,
+            "call_center": 0.85}.get(channel, 0.02)  # most "impressions" for call center are actual calls
     return _add_noise(base, 0.15)
 
 
 def _get_lead_rate(channel: str) -> float:
     return {"paid_search": 0.08, "organic_search": 0.06, "social_paid": 0.05,
             "display": 0.02, "email": 0.12, "video_youtube": 0.03,
-            "events": 0.35, "direct_mail": 0.08}.get(channel, 0.05)
+            "events": 0.35, "direct_mail": 0.08,
+            # Offline: broadcast drives brand consideration (lower conversion
+            # from impressions to leads), call center converts inbound calls
+            # at high rate.
+            "tv_national": 0.08, "radio": 0.10, "ooh": 0.06,
+            "call_center": 0.55}.get(channel, 0.05)
 
 
 def _get_aov(channel: str) -> float:
     return {"paid_search": 1800, "organic_search": 2200, "social_paid": 1200,
             "display": 900, "email": 1500, "video_youtube": 1100,
-            "events": 5500, "direct_mail": 2000}.get(channel, 1500)
+            "events": 5500, "direct_mail": 2000,
+            # Offline AOVs — broadcast drives premium branded purchases;
+            # call center handles larger considered transactions
+            "tv_national": 2400, "radio": 1800, "ooh": 1600,
+            "call_center": 3200}.get(channel, 1500)
 
 
 def _get_bounce_rate(channel: str, campaign: str) -> float:
     base = {"paid_search": 0.38, "organic_search": 0.42, "social_paid": 0.55,
             "display": 0.65, "email": 0.30, "video_youtube": 0.50,
-            "events": 0.15, "direct_mail": 0.45}.get(channel, 0.45)
+            "events": 0.15, "direct_mail": 0.45,
+            # Offline doesn't have web bounces — these are proxy values for
+            # reporting consistency only (the downstream UI can hide them)
+            "tv_national": 0.50, "radio": 0.50, "ooh": 0.55,
+            "call_center": 0.20}.get(channel, 0.45)
     # Some campaigns have deliberately bad landing pages (for diagnostics)
     if "Retargeting" in campaign:
         base *= 0.75  # retargeting bounces less
@@ -487,13 +654,17 @@ def _get_bounce_rate(channel: str, campaign: str) -> float:
 def _get_session_duration(channel: str) -> float:
     return {"paid_search": 145, "organic_search": 195, "social_paid": 85,
             "display": 55, "email": 165, "video_youtube": 70,
-            "events": 300, "direct_mail": 120}.get(channel, 100)
+            "events": 300, "direct_mail": 120,
+            "tv_national": 90, "radio": 75, "ooh": 60,
+            "call_center": 240}.get(channel, 100)
 
 
 def _get_form_rate(channel: str, campaign: str) -> float:
     base = {"paid_search": 0.12, "organic_search": 0.09, "social_paid": 0.06,
             "display": 0.025, "email": 0.18, "video_youtube": 0.04,
-            "events": 0.45, "direct_mail": 0.10}.get(channel, 0.08)
+            "events": 0.45, "direct_mail": 0.10,
+            "tv_national": 0.05, "radio": 0.06, "ooh": 0.04,
+            "call_center": 0.40}.get(channel, 0.08)
     # Deliberately create good-engagement-poor-conversion signals for some
     if campaign in ("Social_TikTok_Brand", "Display_Native"):
         base *= 0.4  # high CTR but poor form completion
@@ -507,7 +678,9 @@ def _get_unsub_rate(channel: str) -> float:
 def _get_nps(channel: str) -> float:
     return {"paid_search": 35, "organic_search": 52, "social_paid": 28,
             "display": 18, "email": 42, "video_youtube": 30,
-            "events": 65, "direct_mail": 25}.get(channel, 30)
+            "events": 65, "direct_mail": 25,
+            "tv_national": 40, "radio": 35, "ooh": 30,
+            "call_center": 55}.get(channel, 30)
 
 
 def _adjust_weights_for_stage(weights, channels, stage):

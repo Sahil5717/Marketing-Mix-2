@@ -29,6 +29,7 @@ export function FindingCard({
   subCopy,
   impactLabel = "Opportunity",
   impactValue,
+  recommendation,     // { action, impact_display, risk, link_to? }
   suppressed = false,
   editorMode = false,
   onEditNote,
@@ -56,11 +57,35 @@ export function FindingCard({
           {subCopy && <SubCopy>{subCopy}</SubCopy>}
         </Body>
 
-        <Impact>
-          <ImpactLabel>{impactLabel}</ImpactLabel>
-          <ImpactValue className="tabular">{impactValue}</ImpactValue>
-        </Impact>
+        {impactValue && impactValue !== "—" && impactValue !== "+$0" && (
+          <Impact>
+            <ImpactLabel>{impactLabel}</ImpactLabel>
+            <ImpactValue className="tabular">{impactValue}</ImpactValue>
+          </Impact>
+        )}
       </Row>
+
+      {recommendation && recommendation.action && (
+        <RecBlock>
+          <RecLabel>What to do</RecLabel>
+          <RecAction>{recommendation.action}</RecAction>
+          <RecMeta>
+            {recommendation.impact_display && (
+              <RecMetaItem $tone="positive">
+                {recommendation.impact_display}
+              </RecMetaItem>
+            )}
+            {recommendation.risk && (
+              <RecMetaItem $tone="warning">
+                ⚠ {recommendation.risk}
+              </RecMetaItem>
+            )}
+            {recommendation.link_to === "plan" && (
+              <RecLink href="?screen=plan">See full plan →</RecLink>
+            )}
+          </RecMeta>
+        </RecBlock>
+      )}
 
       {editorMode && (editorFooter ?? (
         <EditorFooter>
@@ -268,5 +293,69 @@ const FooterButton = styled.button`
   &:hover {
     background: ${t.color.sunken};
     border-color: ${t.color.borderStrong};
+  }
+`;
+
+// ─── Recommendation block ───
+// Renders between the finding body and the editor footer. Visually
+// distinct but part of the same card — findings that imply an action
+// should carry the action inline, not force a separate screen navigation.
+
+const RecBlock = styled.div`
+  margin-top: ${t.space[4]};
+  padding: ${t.space[4]} ${t.space[5]};
+  background: ${t.color.sunken};
+  border-left: 3px solid ${t.color.accent};
+  border-radius: 0 ${t.radius.sm} ${t.radius.sm} 0;
+`;
+
+const RecLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.accentInk};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const RecAction = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.md};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink};
+  line-height: ${t.leading.normal};
+`;
+
+const RecMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: ${t.space[3]};
+  margin-top: ${t.space[3]};
+  align-items: center;
+`;
+
+const RecMetaItem = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.medium};
+  color: ${({ $tone }) =>
+    $tone === "positive" ? t.color.positive :
+    $tone === "warning" ? t.color.accentInk :
+    t.color.ink3};
+  line-height: ${t.leading.normal};
+`;
+
+const RecLink = styled.a`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.accent};
+  text-decoration: none;
+  margin-left: auto;
+
+  &:hover {
+    color: ${t.color.accentHover};
+    text-decoration: underline;
   }
 `;

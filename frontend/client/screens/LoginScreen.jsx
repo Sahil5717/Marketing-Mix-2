@@ -72,6 +72,61 @@ export function LoginScreen() {
     <Root>
       {/* ── Left panel — dark, brand + tagline ── */}
       <Left>
+        {/* Decorative response-curve pattern. Intentionally abstract —
+            evokes the shape of a saturation curve without being literal.
+            In-code SVG so zero copyright risk + scales cleanly. */}
+        <LeftPattern aria-hidden="true">
+          <svg
+            viewBox="0 0 600 800"
+            preserveAspectRatio="xMidYMid slice"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <defs>
+              <linearGradient id="mlCurveGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stopColor="rgba(217, 119, 6, 0.35)" />
+                <stop offset="100%" stopColor="rgba(217, 119, 6, 0.02)" />
+              </linearGradient>
+              <linearGradient id="mlCurveLine" x1="0%" y1="100%" x2="100%" y2="0%">
+                <stop offset="0%" stopColor="rgba(217, 119, 6, 0.6)" />
+                <stop offset="100%" stopColor="rgba(217, 119, 6, 0.15)" />
+              </linearGradient>
+            </defs>
+            {/* Main curve — diminishing-returns shape */}
+            <path
+              d="M 0 720 Q 120 620, 240 440 T 600 200"
+              fill="none"
+              stroke="url(#mlCurveLine)"
+              strokeWidth="1.5"
+            />
+            {/* HDI-like shaded band above and below */}
+            <path
+              d="M 0 680 Q 140 560, 260 380 T 600 150 L 600 280 Q 280 440, 160 600 T 0 760 Z"
+              fill="url(#mlCurveGrad)"
+            />
+            {/* Secondary dotted curve — different channel */}
+            <path
+              d="M 0 780 Q 180 700, 340 540 T 600 320"
+              fill="none"
+              stroke="rgba(255, 255, 255, 0.08)"
+              strokeWidth="1"
+              strokeDasharray="3 4"
+            />
+            {/* Data points scattered along the main curve */}
+            {[
+              [60, 705], [140, 615], [220, 470], [320, 365],
+              [420, 290], [520, 235],
+            ].map(([cx, cy], i) => (
+              <circle
+                key={i}
+                cx={cx}
+                cy={cy}
+                r="3"
+                fill="rgba(217, 119, 6, 0.55)"
+              />
+            ))}
+          </svg>
+        </LeftPattern>
+
         <LeftInner>
           <Brand>
             <BrandMark>M</BrandMark>
@@ -198,10 +253,29 @@ const Left = styled.aside`
   flex-direction: column;
   padding: ${t.space[10]} ${t.space[12]};
   min-height: 100vh;
+  position: relative;
+  overflow: hidden;
 
   @media (max-width: 960px) {
     min-height: auto;
     padding: ${t.space[6]} ${t.space[8]};
+  }
+`;
+
+const LeftPattern = styled.div`
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.9;
+
+  svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  @media (max-width: 960px) {
+    opacity: 0.6;
   }
 `;
 
@@ -213,6 +287,8 @@ const LeftInner = styled.div`
   width: 100%;
   max-width: 520px;
   margin: 0 auto;
+  position: relative;
+  z-index: 1;
 
   @media (max-width: 960px) {
     gap: ${t.space[4]};

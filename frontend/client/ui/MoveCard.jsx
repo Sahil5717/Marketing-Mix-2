@@ -27,20 +27,38 @@ export function MoveCard({
   deltaDirection = "up", // "up" | "down" | "neutral"
   beforeSpend, // e.g. "$3.0M"
   afterSpend,  // e.g. "$5.8M"
+  constraints, // { swing_cap, lead_time_weeks, min_annual_floor } — offline only
+  bayesDeltaHdi, // [lo, hi] dollars — 80% credible region on revenue delta; null when not in Bayesian subset
   onClick,
 }) {
   const clickable = typeof onClick === "function";
+  // Surface offline constraints as a subtle line below the action.
+  // Only shown when there's meaningful info — don't clutter digital moves.
+  const hasOfflineConstraint = constraints &&
+    (constraints.swing_cap != null || constraints.lead_time_weeks > 1);
+  const hasBayesHdi = Array.isArray(bayesDeltaHdi) && bayesDeltaHdi.length === 2;
   return (
     <Card as={clickable ? "button" : "div"} onClick={onClick} $clickable={clickable}>
       <Description>
         <MetaRow>
           <TierChip tier={tier} />
           {channel && <ChannelName>{channel}</ChannelName>}
+          {hasOfflineConstraint && (
+            <ConstraintPill>
+              {constraints.lead_time_weeks} week lead time
+            </ConstraintPill>
+          )}
         </MetaRow>
         {actionNode ? (
           <Action>{actionNode}</Action>
         ) : (
           <Action dangerouslySetInnerHTML={{ __html: action || "" }} />
+        )}
+        {hasOfflineConstraint && constraints.swing_cap != null && (
+          <ConstraintNote>
+            Offline channel — contractually capped at ±{Math.round(constraints.swing_cap * 100)}%
+            per quarter. Optimized move respects this constraint.
+          </ConstraintNote>
         )}
       </Description>
 
@@ -56,9 +74,28 @@ export function MoveCard({
             {beforeSpend} → {afterSpend}
           </SpendTransition>
         )}
+        {hasBayesHdi && (
+          <BayesHdiLine
+            className="tabular"
+            title="Bayesian MMM 80% credible region on this move's revenue impact"
+          >
+            HDI {formatHdiMoney(bayesDeltaHdi[0])} – {formatHdiMoney(bayesDeltaHdi[1])}
+          </BayesHdiLine>
+        )}
       </DeltaBlock>
     </Card>
   );
+}
+
+// Compact dollar formatter for HDI ranges — always signed, always
+// rounded to the same resolution as the main delta
+function formatHdiMoney(n) {
+  if (n == null) return "—";
+  const sign = n < 0 ? "-" : "+";
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}K`;
+  return `${sign}$${Math.round(abs)}`;
 }
 
 // ─── Styled components ───
@@ -164,4 +201,43 @@ const SpendTransition = styled.span`
   font-size: ${t.size.xs};
   color: ${t.color.ink3};
   margin-top: ${t.space[1]};
+`;
+
+const ConstraintPill = styled.span`
+  display: inline-flex;
+  align-items: center;
+  padding: 1px ${t.space[2]};
+  border-radius: ${t.radius.sm};
+  background: ${t.color.accentSub};
+  color: ${t.color.accentInk};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  letter-spacing: ${t.tracking.wider};
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+const ConstraintNote = styled.div`
+  margin-top: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  font-style: italic;
+  line-height: ${t.leading.relaxed};
+`;
+
+const BayesHdiLine = styled.span`
+  margin-top: ${t.space[1]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.accentInk};
+  font-weight: ${t.weight.medium};
+  letter-spacing: ${t.tracking.wider};
+  font-variant-numeric: tabular-nums;
+  /* Subtle but discoverable. Accent-colored so it reads as "Bayesian"
+     without competing with the primary delta value. */
+  opacity: 0.9;
+  white-space: nowrap;
+  cursor: help;
 `;

@@ -1,9 +1,10 @@
 import { useState, useEffect, Suspense, lazy } from "react";
 import { tokens as t } from "./tokens.js";
-import { ensureDiagnosisReady, ensurePlanReady, ensureScenarioReady, ensureChannelDetailReady, getStoredAuth, setUnauthorizedHandler, logout } from "./api.js";
+import { ensureDiagnosisReady, ensurePlanReady, ensureScenarioReady, ensureChannelDetailReady, ensureMarketContextReady, getStoredAuth, setUnauthorizedHandler, logout } from "./api.js";
 import { Diagnosis } from "./screens/Diagnosis.jsx";
 import { Plan } from "./screens/Plan.jsx";
 import { Scenarios } from "./screens/Scenarios.jsx";
+import { MarketContext } from "./screens/MarketContext.jsx";
 // ChannelDetail is lazy-loaded to keep Recharts (~350KB) out of the
 // main bundle. Most users land on Diagnosis and never touch Channels
 // on a first session; no reason to pay for the chart library upfront.
@@ -41,6 +42,7 @@ function getScreenFromUrl() {
   if (s === "plan") return "plan";
   if (s === "scenarios") return "scenarios";
   if (s === "channels" || s === "channel") return "channels";
+  if (s === "market" || s === "market-context") return "market";
   return "diagnosis";
 }
 
@@ -80,6 +82,8 @@ export default function DiagnosisApp() {
       if (screen === "channels") {
         const channelSlug = getChannelFromUrl();
         dataResult = await ensureChannelDetailReady(channelSlug);
+      } else if (screen === "market") {
+        dataResult = await ensureMarketContextReady();
       } else {
         const loader =
           screen === "plan" ? ensurePlanReady :
@@ -138,6 +142,9 @@ export default function DiagnosisApp() {
         <Suspense fallback={<LoadingView />}>
           <ChannelDetail data={state.data} />
         </Suspense>
+      )}
+      {state.status === "ready" && screen === "market" && (
+        <MarketContext data={state.data} />
       )}
 
       <Footer />

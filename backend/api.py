@@ -6,7 +6,7 @@ Run: uvicorn api:app --reload --port 8000
 import os, sys, json, tempfile
 from typing import Optional, Dict
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
@@ -87,6 +87,30 @@ _state: Dict = {
     },
     "external_competitive": None, "external_events": None, "external_trends": None,
     "competitive_result": None, "events_result": None, "trends_result": None,
+    # Engagements — ephemeral, in-memory for the pitch. Real multi-tenancy
+    # would be a separate SQLite table with engagement_id on every data row.
+    # Pre-seeded with a handful of plausible engagements so the screen
+    # feels populated on first view. The "active" one (id matches
+    # active_engagement_id) is what Diagnosis/Plan/etc. render against —
+    # today they all render against the same mock data regardless, but
+    # the field exists so the shell can show a "current engagement" badge.
+    "engagements": None,  # populated lazily on first /api/engagements call
+    "active_engagement_id": "acme-fy2025",
+    # Bayesian MMM — fit in a background thread after run-analysis completes.
+    # `_bayes_status` holds the current lifecycle state the UI polls; `_bayes_result`
+    # is the full result once the fit converges. Never blocks the main
+    # request cycle. See _kickoff_bayesian_fit.
+    "bayes_status": {
+        "state": "idle",         # idle | pending | running | ready | failed | non_converged
+        "started_at": None,      # ISO timestamp
+        "finished_at": None,     # ISO timestamp
+        "elapsed_s": None,
+        "r_hat_max": None,
+        "ess_min": None,
+        "n_channels": None,
+        "message": None,
+    },
+    "bayes_result": None,
 }
 
 class NumpyEncoder(json.JSONEncoder):
@@ -488,6 +512,200 @@ def _run_all_engines():
         print(f"[WARN] Session persist failed: {e}")
 
 
+# ═══════════════════════════════════════════════
+#  BAYESIAN MMM — BACKGROUND FIT
+# ═══════════════════════════════════════════════
+#
+# The Bayesian MMM is run in a background thread so the main
+# /api/run-analysis request returns in ~5 seconds (frequentist path)
+# instead of ~3 minutes (Bayesian). The UI polls /api/bayes-status
+# and renders a "pending | running | ready" chip. Once ready, credible
+# intervals on channel ROAS and response curves become available via
+# /api/bayes-result.
+#
+# Fit scope: up to BAYES_MAX_CHANNELS channels (default 6) chosen by
+# absolute spend. This keeps a single NUTS fit under ~3 minutes on
+# Railway-grade hardware. Pitch channels (paid_search, social_paid,
+# tv_national, events, email, direct_mail) are all in the top-spend
+# list, so the priority selection happens naturally.
+#
+# Thread-safety: _state writes are atomic enough for our use (single
+# dict key assignments). Python's GIL + the structure of dict writes
+# means we don't need a lock for correctness here. We DO need to be
+# careful to not MUTATE _state["bayes_status"] in place — always
+# replace the whole dict — to avoid torn reads on the polling side.
+
+import threading
+import datetime
+
+BAYES_MAX_CHANNELS = 6
+BAYES_CHANNEL_WHITELIST = [
+    # In priority order. The fit uses the intersection of this list with
+    # the channels that are actually in the loaded data, capped at
+    # BAYES_MAX_CHANNELS. Picks one channel per archetype so the pitch
+    # story ("we handle all your channel types") lands.
+    "paid_search", "social_paid", "tv_national", "events", "email", "direct_mail",
+    # Fallbacks if any of the above aren't in the data
+    "display", "video_youtube", "radio", "ooh", "call_center", "organic_search",
+]
+
+
+def _set_bayes_status(**updates):
+    """Atomically update the bayes_status dict. Always replace the dict
+    reference so concurrent readers see a consistent snapshot."""
+    current = dict(_state.get("bayes_status") or {})
+    current.update(updates)
+    _state["bayes_status"] = current
+
+
+def _bayes_subset_df(df):
+    """Return the campaign dataframe restricted to the Bayesian fit channels."""
+    present = set(df["channel"].unique())
+    picks = [c for c in BAYES_CHANNEL_WHITELIST if c in present][:BAYES_MAX_CHANNELS]
+    if len(picks) < 3:
+        return None, picks
+    return df[df["channel"].isin(picks)].copy(), picks
+
+
+def _kickoff_bayesian_fit():
+    """Spawn a daemon thread to run the Bayesian MMM fit. Idempotent:
+    if a fit is already running, this is a no-op."""
+    current_state = (_state.get("bayes_status") or {}).get("state")
+    if current_state in ("pending", "running"):
+        print(f"[bayes] Fit already in progress ({current_state}); skipping kickoff")
+        return
+
+    _set_bayes_status(
+        state="pending",
+        started_at=datetime.datetime.utcnow().isoformat() + "Z",
+        finished_at=None,
+        elapsed_s=None,
+        r_hat_max=None,
+        ess_min=None,
+        message="Queued for background fit",
+    )
+
+    t = threading.Thread(target=_run_bayesian_fit_background, daemon=True, name="bayes-fit")
+    t.start()
+
+
+def _run_bayesian_fit_background():
+    """Thread body: fit the Bayesian MMM, update state on completion.
+    All errors are caught and turned into failed status rather than crashing."""
+    import time as _time
+
+    df = _state.get("campaign_data")
+    if df is None:
+        _set_bayes_status(state="failed", message="No campaign data loaded")
+        return
+
+    subset_df, picks = _bayes_subset_df(df)
+    if subset_df is None:
+        _set_bayes_status(
+            state="failed",
+            message=f"Only {len(picks)} channels available; Bayesian needs 3+",
+        )
+        return
+
+    _set_bayes_status(
+        state="running",
+        n_channels=len(picks),
+        message=f"Fitting {len(picks)} channels via PyMC NUTS",
+    )
+    t0 = _time.time()
+    try:
+        # Small-budget fit to stay within Railway timeouts. 300 draws × 2 chains
+        # × 300 tune = enough for stable posterior summaries on 48 periods
+        # and completes in ~90s on commodity hardware. More draws/chains only
+        # tighten the HDIs slightly at significant time cost.
+        result = run_mmm(
+            subset_df, method="bayesian", n_draws=300, n_chains=2, n_tune=300
+        )
+        elapsed = _time.time() - t0
+        diag = result.get("model_diagnostics", {}) or {}
+        converged = bool(diag.get("converged"))
+        r_hat_max = diag.get("r_hat_max")
+        ess_min = diag.get("ess_min")
+
+        if not converged:
+            _set_bayes_status(
+                state="non_converged",
+                finished_at=datetime.datetime.utcnow().isoformat() + "Z",
+                elapsed_s=round(elapsed, 1),
+                r_hat_max=r_hat_max,
+                ess_min=ess_min,
+                message=(
+                    f"Sampled {len(picks)} channels in {elapsed:.0f}s but did not converge "
+                    f"(r-hat={r_hat_max}, ESS={ess_min}). Credible intervals hidden."
+                ),
+            )
+            _state["bayes_result"] = None
+            return
+
+        _state["bayes_result"] = result
+        _set_bayes_status(
+            state="ready",
+            finished_at=datetime.datetime.utcnow().isoformat() + "Z",
+            elapsed_s=round(elapsed, 1),
+            r_hat_max=r_hat_max,
+            ess_min=ess_min,
+            message=(
+                f"Fit complete in {elapsed:.0f}s · r-hat {r_hat_max:.3f} · ESS {int(ess_min)}"
+            ),
+        )
+        print(f"[bayes] Fit ready in {elapsed:.1f}s, r-hat={r_hat_max}, ESS={ess_min}")
+    except Exception as e:
+        elapsed = _time.time() - t0
+        _set_bayes_status(
+            state="failed",
+            finished_at=datetime.datetime.utcnow().isoformat() + "Z",
+            elapsed_s=round(elapsed, 1),
+            message=f"Fit raised: {type(e).__name__}: {e}",
+        )
+        print(f"[bayes] Fit failed after {elapsed:.1f}s: {e}")
+
+
+@app.get("/api/bayes-status")
+def get_bayes_status():
+    """Return the current Bayesian fit lifecycle state. Polled by the UI.
+
+    Side effect: if the server has analyzed data but no Bayesian fit has
+    been kicked off (state=="idle"), kick one off now. This handles the
+    edge case where a session was restored from SQLite after a server
+    restart — the analysis data is there but we never ran Bayesian for
+    this process instance. Without this, the chip would stay "idle"
+    forever and the pitch demo would show no Bayesian.
+    """
+    status = _state.get("bayes_status") or {}
+    if status.get("state") == "idle" and _state.get("campaign_data") is not None:
+        _kickoff_bayesian_fit()
+        status = _state.get("bayes_status") or {}
+    return _j(status)
+
+
+@app.post("/api/bayes-refit")
+def refit_bayesian():
+    """Manually trigger a Bayesian fit. Useful for 'refresh' buttons in UI
+    or for demo resets. No-ops if a fit is already in progress."""
+    if _state.get("campaign_data") is None:
+        raise HTTPException(400, "No data loaded")
+    _kickoff_bayesian_fit()
+    return _j(_state.get("bayes_status") or {})
+
+
+@app.get("/api/bayes-result")
+def get_bayes_result():
+    """Return the Bayesian fit result. Returns 404 if not yet ready."""
+    status = _state.get("bayes_status") or {}
+    state = status.get("state")
+    if state != "ready":
+        raise HTTPException(
+            404,
+            f"Bayesian result not available (state={state}). Poll /api/bayes-status.",
+        )
+    return _j(_state.get("bayes_result") or {})
+
+
 @app.post("/api/run-analysis")
 def run_full_analysis(model_type: str = "power_law"):
     """Run all engines on current data. Accepts model_type: power_law or hill."""
@@ -495,6 +713,9 @@ def run_full_analysis(model_type: str = "power_law"):
         raise HTTPException(400, "No data loaded")
     _state["_model_type"] = model_type
     _run_all_engines()
+    # Fire the Bayesian MMM in the background so the request returns
+    # immediately. The UI polls /api/bayes-status to see when it lands.
+    _kickoff_bayesian_fit()
     return _j({
         "status": "complete",
         "model_type": model_type,
@@ -787,6 +1008,274 @@ def list_channels():
     })
 
 
+@app.get("/api/market-context")
+def get_market_context():
+    """
+    Full market-context payload for the dedicated Market Context screen.
+
+    Aggregates what the three external-data engines have produced:
+      - events_result: upcoming events timeline + near-term recommendations
+      - trends_result: cost-trend snapshots, benchmarks, category growth
+      - competitive_result: share-of-voice per channel, pressure index,
+        at-risk channels
+
+    The sidebar card on /api/diagnosis surfaces a trimmed version of this
+    (up to 6 events, 2 alerts). This endpoint returns the full data for
+    the dedicated screen: every event, all trends, per-channel SOV
+    breakdown, plus narrative summaries.
+
+    Empty sections are returned as empty arrays so the frontend can
+    render empty states gracefully rather than 404'ing when a user
+    hasn't uploaded a given file yet.
+    """
+    events_result = _state.get("events_result") or {}
+    trends_result = _state.get("trends_result") or {}
+    competitive_result = _state.get("competitive_result") or {}
+
+    sources_loaded = []
+    if _state.get("external_events") is not None:
+        sources_loaded.append("events")
+    if _state.get("external_trends") is not None:
+        sources_loaded.append("trends")
+    if _state.get("external_competitive") is not None:
+        sources_loaded.append("competitive")
+
+    # Events: full timeline sorted by date
+    all_events = sorted(
+        events_result.get("events", []),
+        key=lambda e: e.get("days_away", 999_999)
+    )
+
+    # Trends: restructure by metric type for the UI. The engine returns
+    # cost_adjustments keyed by channel; we flatten to a list and also
+    # pull out benchmarks + category_growth.
+    cost_adjustments = []
+    for ch, adj in (trends_result.get("cost_adjustments") or {}).items():
+        cost_adjustments.append({
+            "channel": ch,
+            "channel_display": ch.replace("_", " ").title(),
+            **(adj if isinstance(adj, dict) else {}),
+        })
+    cost_adjustments.sort(
+        key=lambda c: abs(c.get("yoy_change_pct", 0) or 0),
+        reverse=True
+    )
+
+    # Competitive: flatten share_of_voice per channel into a list
+    sov_list = []
+    for ch, sov in (competitive_result.get("share_of_voice") or {}).items():
+        if not isinstance(sov, dict):
+            continue
+        sov_list.append({
+            "channel": ch,
+            "channel_display": ch.replace("_", " ").title(),
+            "our_spend": sov.get("our_spend", 0),
+            "competitor_spend": sov.get("competitor_spend", 0),
+            "total_market": sov.get("total_market", 0),
+            "share_of_voice": sov.get("share_of_voice", 0),
+            "competitive_pressure_index": sov.get("competitive_pressure_index", 0),
+        })
+    # Most competitive pressure first (lowest SOV = under pressure)
+    sov_list.sort(key=lambda r: r.get("share_of_voice", 1.0))
+
+    # Headline summary — a single sentence framing the state of the
+    # market context overall. Dynamic based on what's loaded.
+    headline_bits = []
+    if "events" in sources_loaded:
+        upcoming = events_result.get("summary", {}).get("upcoming_events", 0)
+        if upcoming:
+            headline_bits.append(f"{upcoming} upcoming event{'s' if upcoming != 1 else ''}")
+    if "trends" in sources_loaded:
+        n_adj = len(cost_adjustments)
+        if n_adj:
+            headline_bits.append(f"{n_adj} channel{'s' if n_adj != 1 else ''} with cost trend signals")
+    if "competitive" in sources_loaded:
+        at_risk = competitive_result.get("summary", {}).get("at_risk_channels", 0)
+        n_ch = competitive_result.get("summary", {}).get("n_channels_tracked", 0)
+        if n_ch:
+            headline_bits.append(f"{n_ch} channels vs {competitive_result.get('summary', {}).get('n_competitors', '?')} competitors")
+
+    if headline_bits:
+        headline = "Tracking " + ", ".join(headline_bits) + "."
+    else:
+        headline = "No external data uploaded yet. Upload events, trends, or competitive data on the Workspace screen to populate this view."
+
+    return _j({
+        "headline": headline,
+        "data_sources_loaded": sources_loaded,
+        "events": {
+            "all": all_events,
+            "summary": events_result.get("summary", {}),
+            "recommendations": events_result.get("recommendations", []),
+        },
+        "trends": {
+            "cost_adjustments": cost_adjustments,
+            "benchmarks": trends_result.get("benchmarks", {}),
+            "category_growth": trends_result.get("category_growth", {}),
+            "search_interest": trends_result.get("search_interest", {}),
+            "recommendations": trends_result.get("recommendations", []),
+            "summary": trends_result.get("summary", {}),
+        },
+        "competitive": {
+            "share_of_voice": sov_list,
+            "competitive_pressure": competitive_result.get("competitive_pressure", {}),
+            "recommendations": competitive_result.get("recommendations", []),
+            "summary": competitive_result.get("summary", {}),
+        },
+    })
+
+
+# ═══════════════════════════════════════════════
+#  ENGAGEMENTS
+# ═══════════════════════════════════════════════
+#
+# Engagements represent consulting projects — a client + period + status.
+# The current implementation is DELIBERATELY lightweight:
+#
+#   - State is in-memory only. Deleting an engagement is ephemeral; a
+#     restart reseeds the defaults.
+#   - All engagements share the same analysis data (mock data). Switching
+#     "active engagement" is a UI-only change; Diagnosis/Plan etc. render
+#     the same numbers regardless.
+#   - No per-engagement data uploads, no per-engagement authorization.
+#
+# This is enough for the pitch ("we track multiple engagements") without
+# the full multi-tenant data-isolation lift that proper engagements
+# require. That lift — separate SQLite table, engagement_id FK on every
+# data row, per-engagement auth checks — is explicitly deferred and
+# documented.
+
+def _seed_engagements():
+    """Return a seeded list of engagements. Called lazily."""
+    import datetime
+    today = datetime.date.today()
+    return [
+        {
+            "id": "acme-fy2025",
+            "client": "Acme Retail",
+            "engagement_name": "Acme Retail FY2025 Budget Review",
+            "period": "Jan 2025 – Dec 2025",
+            "status": "active",
+            "owner": "Sarah Rahman",
+            "last_updated": today.isoformat(),
+            "summary": "Full portfolio review with MMM + attribution + scenario planning.",
+        },
+        {
+            "id": "contoso-q3",
+            "client": "Contoso Foods",
+            "engagement_name": "Contoso Foods Q3 2025 Scenarios",
+            "period": "Jul – Sep 2025",
+            "status": "in_review",
+            "owner": "Sarah Rahman",
+            "last_updated": (today - datetime.timedelta(days=6)).isoformat(),
+            "summary": "Budget scenarios for Q3 holiday push.",
+        },
+        {
+            "id": "initech-audit",
+            "client": "Initech",
+            "engagement_name": "Initech Media Mix Audit",
+            "period": "Mar – May 2025",
+            "status": "wrapped",
+            "owner": "Marcus Li",
+            "last_updated": (today - datetime.timedelta(days=45)).isoformat(),
+            "summary": "One-time audit of last 18 months of media investment.",
+        },
+        {
+            "id": "umbrella-plan",
+            "client": "Umbrella Corp",
+            "engagement_name": "Umbrella FY26 Budget Plan",
+            "period": "Sep – Nov 2025",
+            "status": "active",
+            "owner": "Sarah Rahman",
+            "last_updated": (today - datetime.timedelta(days=2)).isoformat(),
+            "summary": "Building the FY26 marketing plan from internal targets.",
+        },
+    ]
+
+
+def _ensure_engagements_seeded():
+    if _state.get("engagements") is None:
+        _state["engagements"] = _seed_engagements()
+
+
+@app.get("/api/engagements")
+def list_engagements():
+    """List all engagements plus the active engagement id."""
+    _ensure_engagements_seeded()
+    return _j({
+        "engagements": _state["engagements"],
+        "active_engagement_id": _state.get("active_engagement_id"),
+    })
+
+
+@app.post("/api/engagements")
+def create_engagement(payload: dict = Body(...)):
+    """
+    Create a new engagement. Accepts client, engagement_name, period, status.
+    Validates minimally; this is demo-grade CRUD.
+    """
+    _ensure_engagements_seeded()
+    client = str(payload.get("client", "")).strip()
+    name = str(payload.get("engagement_name", "")).strip()
+    period = str(payload.get("period", "")).strip()
+    status = str(payload.get("status", "active")).strip()
+    if not client or not name or not period:
+        raise HTTPException(400, "client, engagement_name, and period are required")
+    if status not in ("active", "in_review", "wrapped"):
+        status = "active"
+
+    # ID generation: slug from client + simple increment on collision
+    import re, datetime
+    base_slug = re.sub(r"[^a-z0-9]+", "-", client.lower()).strip("-")
+    suffix = 1
+    new_id = base_slug or "engagement"
+    existing_ids = {e["id"] for e in _state["engagements"]}
+    while new_id in existing_ids:
+        suffix += 1
+        new_id = f"{base_slug}-{suffix}"
+
+    new_engagement = {
+        "id": new_id,
+        "client": client,
+        "engagement_name": name,
+        "period": period,
+        "status": status,
+        "owner": payload.get("owner") or "Sarah Rahman",
+        "last_updated": datetime.date.today().isoformat(),
+        "summary": payload.get("summary") or "",
+    }
+    _state["engagements"].append(new_engagement)
+    return _j({"engagement": new_engagement})
+
+
+@app.delete("/api/engagements/{engagement_id}")
+def delete_engagement(engagement_id: str):
+    """Delete an engagement. Refuses to delete the active one."""
+    _ensure_engagements_seeded()
+    if engagement_id == _state.get("active_engagement_id"):
+        raise HTTPException(
+            400,
+            "Cannot delete the currently-active engagement. Switch active first.",
+        )
+    before = len(_state["engagements"])
+    _state["engagements"] = [e for e in _state["engagements"] if e["id"] != engagement_id]
+    if len(_state["engagements"]) == before:
+        raise HTTPException(404, f"Engagement '{engagement_id}' not found")
+    return _j({"status": "deleted", "engagement_id": engagement_id})
+
+
+@app.post("/api/engagements/{engagement_id}/activate")
+def activate_engagement(engagement_id: str):
+    """Mark an engagement as active. Does NOT reload data — the demo
+    uses the same mock data across all engagements."""
+    _ensure_engagements_seeded()
+    ids = {e["id"] for e in _state["engagements"]}
+    if engagement_id not in ids:
+        raise HTTPException(404, f"Engagement '{engagement_id}' not found")
+    _state["active_engagement_id"] = engagement_id
+    return _j({"status": "ok", "active_engagement_id": engagement_id})
+
+
 @app.get("/api/deep-dive/{channel}")
 def get_channel_deep_dive(channel: str):
     """
@@ -865,20 +1354,145 @@ def get_channel_deep_dive(channel: str):
     campaign_col = "campaign" if "campaign" in ch_data.columns else ("camp" if "camp" in ch_data.columns else None)
     campaigns = []
     if campaign_col:
-        by_camp = ch_data.groupby(campaign_col).agg(
-            spend=("spend", "sum"),
-            revenue=("revenue", "sum"),
-            conversions=("conversions", "sum"),
-        ).reset_index()
+        # Aggregate across campaign-level data
+        agg_args = {
+            "spend": ("spend", "sum"),
+            "revenue": ("revenue", "sum"),
+            "conversions": ("conversions", "sum"),
+        }
+        # Add clicks/impressions if available for CTR/CVR
+        if "clicks" in ch_data.columns:
+            agg_args["clicks"] = ("clicks", "sum")
+        if "impressions" in ch_data.columns:
+            agg_args["impressions"] = ("impressions", "sum")
+        # Offline-specific metrics. These are 0 for digital channels so the
+        # sum will also be 0 — the frontend conditionally renders based on
+        # the channel's attribution_basis rather than presence of data.
+        for col in ("grps", "reach", "store_visits", "calls_generated",
+                    "event_attendees", "dealer_enquiries"):
+            if col in ch_data.columns:
+                # reach is "max over the period" not "sum" — summing monthly
+                # reach double-counts the same viewers. For the others, sum
+                # is the right aggregation.
+                agg_method = "mean" if col == "reach" else "sum"
+                agg_args[col] = (col, agg_method)
+
+        by_camp = ch_data.groupby(campaign_col).agg(**agg_args).reset_index()
         by_camp["roas"] = by_camp["revenue"] / by_camp["spend"].replace(0, 1)
         by_camp = by_camp.sort_values("spend", ascending=False).head(20)
+
+        # Channel-level totals for share calculations
+        ch_total_spend = float(ch_data["spend"].sum())
+        ch_total_revenue = float(ch_data["revenue"].sum())
+
+        # QoQ trend: compare last quarter vs prior quarter per campaign.
+        # Requires the date column to be parseable.
+        qoq_trend = {}
+        sparkline_data = {}
+        try:
+            ch_data_dated = ch_data.copy()
+            ch_data_dated["date"] = pd.to_datetime(ch_data_dated["date"], errors="coerce")
+            ch_data_dated = ch_data_dated.dropna(subset=["date"])
+            if len(ch_data_dated) > 0:
+                max_date = ch_data_dated["date"].max()
+                # Last quarter = last 90 days; prior = 91-180 days ago
+                last_q = ch_data_dated[ch_data_dated["date"] > (max_date - pd.Timedelta(days=90))]
+                prior_q = ch_data_dated[
+                    (ch_data_dated["date"] <= (max_date - pd.Timedelta(days=90))) &
+                    (ch_data_dated["date"] > (max_date - pd.Timedelta(days=180)))
+                ]
+                for camp in by_camp[campaign_col]:
+                    last_rev = float(last_q[last_q[campaign_col] == camp]["revenue"].sum())
+                    prior_rev = float(prior_q[prior_q[campaign_col] == camp]["revenue"].sum())
+                    if prior_rev > 0:
+                        pct = (last_rev - prior_rev) / prior_rev * 100
+                        qoq_trend[camp] = {
+                            "pct": round(pct, 1),
+                            "direction": "up" if pct > 2 else "down" if pct < -2 else "flat",
+                        }
+                    else:
+                        qoq_trend[camp] = {"pct": 0, "direction": "flat"}
+
+                # Build 12-month revenue sparklines per campaign
+                ch_data_dated["month"] = ch_data_dated["date"].dt.to_period("M").astype(str)
+                last_12 = sorted(ch_data_dated["month"].unique())[-12:]
+                for camp in by_camp[campaign_col]:
+                    camp_monthly = ch_data_dated[ch_data_dated[campaign_col] == camp].groupby("month")["revenue"].sum()
+                    sparkline_data[camp] = [
+                        {"month": m, "revenue": round(float(camp_monthly.get(m, 0)), 0)}
+                        for m in last_12
+                    ]
+        except Exception:
+            pass
+
         for _, row in by_camp.iterrows():
+            camp_name = str(row[campaign_col])
+            spend_val = float(row["spend"])
+            revenue_val = float(row["revenue"])
+            conv_val = int(row["conversions"])
+            clicks_val = float(row.get("clicks", 0)) if "clicks" in row.index else 0
+            impr_val = float(row.get("impressions", 0)) if "impressions" in row.index else 0
+            roas = float(row["roas"])
+
+            cpa = (spend_val / conv_val) if conv_val > 0 else None
+            ctr = (clicks_val / impr_val * 100) if impr_val > 0 else None
+            cvr = (conv_val / clicks_val * 100) if clicks_val > 0 else None
+            spend_share = (spend_val / ch_total_spend * 100) if ch_total_spend > 0 else 0
+            revenue_share = (revenue_val / ch_total_revenue * 100) if ch_total_revenue > 0 else 0
+
+            # Per-campaign recommendation — decisive text based on metrics
+            # rather than inheriting the channel-level action uniformly.
+            # Thresholds are gentle by design: "Hold" should be the
+            # minority outcome when something stands out, not the default.
+            recommendation = "Hold"
+            camp_trend = qoq_trend.get(camp_name, {})
+
+            # Find best + worst performing campaign in this channel for
+            # relative comparisons
+            best_roas = by_camp["roas"].max() if len(by_camp) > 1 else roas
+            worst_roas = by_camp["roas"].min() if len(by_camp) > 1 else roas
+
+            if camp_trend.get("direction") == "down" and camp_trend.get("pct", 0) < -10:
+                recommendation = "Investigate drop"
+            elif cvr is not None and cvr < 0.3 and ctr is not None and ctr > 2:
+                recommendation = "Review landing page"
+            elif roas >= best_roas * 0.95 and spend_share < revenue_share:
+                # Top-tier ROAS and under-indexed on spend share
+                recommendation = "Scale"
+            elif roas <= worst_roas * 1.1 and spend_share > revenue_share * 1.1:
+                # Worst in class and over-indexed — reduce
+                recommendation = "Reduce"
+            elif roas < 2.0:
+                recommendation = "Reduce"
+            elif spend_share > revenue_share * 1.15:
+                recommendation = "Rebalance down"
+            elif spend_share < revenue_share * 0.9 and roas >= 3.0:
+                recommendation = "Increase share"
+            else:
+                recommendation = "Hold"
+
             campaigns.append({
-                "campaign": str(row[campaign_col]),
-                "spend": round(float(row["spend"]), 0),
-                "revenue": round(float(row["revenue"]), 0),
-                "roas": round(float(row["roas"]), 2),
-                "conversions": int(row["conversions"]),
+                "campaign": camp_name,
+                "spend": round(spend_val, 0),
+                "revenue": round(revenue_val, 0),
+                "roas": round(roas, 2),
+                "conversions": conv_val,
+                "cpa": round(cpa, 0) if cpa is not None else None,
+                "ctr_pct": round(ctr, 2) if ctr is not None else None,
+                "cvr_pct": round(cvr, 2) if cvr is not None else None,
+                "spend_share_pct": round(spend_share, 1),
+                "revenue_share_pct": round(revenue_share, 1),
+                "qoq_trend": camp_trend,
+                "sparkline": sparkline_data.get(camp_name, []),
+                "recommendation": recommendation,
+                # Offline-specific metrics — the frontend only shows these
+                # when the channel's attribution_basis is reach or direct_response.
+                "grps": round(float(row.get("grps", 0) or 0), 0),
+                "reach": int(row.get("reach", 0) or 0),
+                "store_visits": int(row.get("store_visits", 0) or 0),
+                "calls_generated": int(row.get("calls_generated", 0) or 0),
+                "event_attendees": int(row.get("event_attendees", 0) or 0),
+                "dealer_enquiries": int(row.get("dealer_enquiries", 0) or 0),
             })
 
     # Confidence tier for the KPI card — from the curve diagnostics if
@@ -931,9 +1545,89 @@ def get_channel_deep_dive(channel: str):
                     for s in np.linspace(0, target_xmax, 60)
                 ]
 
+    # Channel taxonomy + honest framing for offline channels.
+    # Pulled from the channel-data rows (every row carries the same
+    # attribution_basis/primary_metric for a given channel).
+    attribution_basis = "click"
+    primary_metric = "clicks"
+    channel_type = "online"
+    if "attribution_basis" in ch_data.columns and len(ch_data) > 0:
+        attribution_basis = str(ch_data["attribution_basis"].iloc[0])
+    if "primary_metric" in ch_data.columns and len(ch_data) > 0:
+        primary_metric = str(ch_data["primary_metric"].iloc[0])
+    if "channel_type" in ch_data.columns and len(ch_data) > 0:
+        channel_type = str(ch_data["channel_type"].iloc[0])
+
+    # Aggregate offline metrics at the channel level for KPI display
+    channel_offline_agg = {}
+    for col in ("grps", "calls_generated", "event_attendees",
+                "dealer_enquiries", "store_visits"):
+        if col in ch_data.columns:
+            total = float(ch_data[col].sum())
+            if total > 0:
+                channel_offline_agg[col] = int(total)
+    # Reach: use the mean monthly reach (not sum — that double-counts)
+    if "reach" in ch_data.columns:
+        avg_reach = float(ch_data["reach"].mean())
+        if avg_reach > 0:
+            channel_offline_agg["avg_monthly_reach"] = int(avg_reach)
+
+    # Honest caveat text for non-click channels. This is shown as a
+    # banner on the Channel Detail screen — better to signal the
+    # limitation up-front than let users think "CTR 0.15%" is a real
+    # performance metric for TV.
+    offline_notes = None
+    if attribution_basis == "reach":
+        offline_notes = {
+            "kind": "reach_based",
+            "headline": f"{channel.replace('_',' ').title()} uses a reach-based attribution model",
+            "body": (
+                f"This channel doesn't have click-level tracking. The primary "
+                f"measurement unit is {primary_metric} — GRPs for broadcast, "
+                f"reach for OOH. Revenue attribution here is derived from "
+                f"modeled lift rather than direct conversion tracking. "
+                f"Click/CTR/CVR columns are hidden because they aren't "
+                f"meaningful for this channel."
+            ),
+        }
+    elif attribution_basis == "direct_response":
+        offline_notes = {
+            "kind": "direct_response",
+            "headline": f"{channel.replace('_',' ').title()} uses direct-response attribution",
+            "body": (
+                f"Primary measurement is {primary_metric.replace('_',' ')}. "
+                f"These are inbound responses tied directly to the channel — "
+                f"calls for call center, attendees for events, enquiries for "
+                f"direct mail. Click metrics are not tracked."
+            ),
+        }
+
+    # Adstock profile for this channel — surface the model's decay treatment
+    # so the UI can explain why broadcast and digital are handled differently.
+    # This is light-touch: just echo what the channel-aware fitter decided.
+    # Actual adstock diagnostics (decay, carryover %) are on /api/adstock.
+    adstock_profile = None
+    try:
+        from engines.adstock import _channel_adstock_profile
+        _ap = _channel_adstock_profile(channel, attribution_basis)
+        adstock_profile = {
+            "type": _ap["adstock_type"],
+            "expected_carryover_pct": _ap["expected_carryover_pct"],
+        }
+    except Exception:
+        pass
+
     return _j({
         "channel": channel,
         "channel_display": channel.replace("_", " ").title(),
+        "channel_meta": {
+            "channel_type": channel_type,
+            "attribution_basis": attribution_basis,
+            "primary_metric": primary_metric,
+            "offline_aggregates": channel_offline_agg,
+            "offline_notes": offline_notes,
+            "adstock_profile": adstock_profile,
+        },
         "monthly_trend": trend.to_dict(orient="records"),
         "regional_breakdown": regional.to_dict(orient="records"),
         "funnel": funnel,
@@ -1179,6 +1873,174 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
                 kpis["plan_confidence"]["mape_display"] = f"MAPE {avg_mape:.1f}%"
 
     result["kpis"] = kpis
+
+    # Enrich each finding with a richer recommendation block.
+    # Per-finding the backend already gives a short "prescribed_action".
+    # We pair this with the matching move from the optimizer (so the
+    # dollar delta, before→after spend, and confidence tier stay in
+    # sync with the Plan screen), and add a risk note where we have
+    # enough signal to surface one.
+    opt_state = _state.get("optimization") or {}
+    moves_by_channel = {m.get("channel"): m for m in opt_state.get("channels", [])}
+
+    findings = result.get("findings") or []
+    for f in findings:
+        channel = (f.get("evidence_metric") or {}).get("channel")
+        move = moves_by_channel.get(channel) if channel else None
+
+        action_text = f.get("prescribed_action")
+        impact = f.get("impact_dollars", 0)
+        ftype = f.get("type", "opportunity")
+
+        # If there's no matching channel move (cross-cutting findings like
+        # channel_gap), build a generic recommendation from the finding's
+        # own action text rather than dropping the field entirely
+        if not move:
+            fallback_action = action_text
+            if not fallback_action:
+                # Pattern-match on headline for common cross-cutting cases
+                headline = (f.get("headline") or "").lower()
+                if "online" in headline and "offline" in headline:
+                    fallback_action = ("Evaluate online vs offline mix. If offline "
+                                       "carries strategic value (brand, reach), "
+                                       "maintain; otherwise shift.")
+                elif "momentum" in headline or "accelerat" in headline:
+                    fallback_action = ("Sustain current strategy. Watch for "
+                                       "deceleration in monthly performance.")
+                elif "concentration" in headline or "risk" in headline:
+                    fallback_action = ("Diversify across channels to reduce "
+                                       "single-channel exposure.")
+                else:
+                    fallback_action = None
+
+            if fallback_action:
+                f["recommendation"] = {
+                    "action": fallback_action,
+                    "impact_display": (f"+${impact/1e6:.1f}M annual uplift"
+                                       if impact and impact >= 1e6
+                                       else f"+${impact/1e3:.0f}K annual uplift"
+                                       if impact else None),
+                    "link_to": "plan",
+                    "risk": None,
+                }
+            continue
+
+        current = float(move.get("current_spend") or 0)
+        optimized = float(move.get("optimized_spend") or 0)
+        change_pct = ((optimized - current) / current * 100) if current > 0 else 0
+
+        # Build a fuller action sentence keyed off the move
+        if abs(change_pct) < 2:
+            action = f"Hold {channel.replace('_', ' ').title()} near current spend."
+        elif change_pct > 0:
+            action = (f"Increase {channel.replace('_', ' ').title()} spend by "
+                      f"{change_pct:+.0f}% — from ${current/1e6:.1f}M to "
+                      f"${optimized/1e6:.1f}M.")
+        else:
+            action = (f"Reduce {channel.replace('_', ' ').title()} spend by "
+                      f"{change_pct:+.0f}% — from ${current/1e6:.1f}M to "
+                      f"${optimized/1e6:.1f}M.")
+
+        # Impact line — prefer the optimizer's revenue_delta if present,
+        # fall back to the finding's impact_dollars
+        rev_delta = move.get("revenue_delta", 0) or impact or 0
+        if abs(rev_delta) >= 1e6:
+            impact_display = f"Projected revenue {'+' if rev_delta>0 else ''}${rev_delta/1e6:.1f}M"
+        elif abs(rev_delta) >= 1e3:
+            impact_display = f"Projected revenue {'+' if rev_delta>0 else ''}${rev_delta/1e3:.0f}K"
+        else:
+            impact_display = None
+
+        # Risk — surface a caution for aggressive moves or low-reliability
+        risk = None
+        reliability = str(move.get("reliability", "")).lower()
+        if abs(change_pct) > 40:
+            risk = (f"Aggressive move. Validate with a 4-6 week geo-holdout "
+                    f"before scaling beyond 50% of the target.")
+        elif reliability in ("low", "inconclusive"):
+            risk = ("Response curve for this channel is inconclusive — "
+                    "treat the optimizer's target as directional, not a commitment.")
+        elif ftype == "warning":
+            risk = ("This is a cost/efficiency warning, not a growth move. "
+                    "Fix the underlying CAC issue before scaling.")
+
+        f["recommendation"] = {
+            "action": action,
+            "impact_display": impact_display,
+            "link_to": "plan",
+            "channel": channel,
+            "risk": risk,
+            "change_pct": round(change_pct, 1),
+            "before_spend": current,
+            "after_spend": optimized,
+        }
+
+    result["findings"] = findings
+
+    # Market context — surface external data (events, competitive, trends)
+    # that's been uploaded. Even if the 90-day recommendation window
+    # isn't firing, the user uploaded the data and expects to see it
+    # reflected somewhere. This block is where it appears.
+    market_context = {
+        "events": [],
+        "event_recommendations": [],
+        "trends_alerts": [],
+        "competitive_snapshot": None,
+        "data_sources_loaded": [],
+    }
+
+    er = _state.get("events_result") or {}
+    if er.get("events"):
+        # Surface up to 6 upcoming events, sorted soonest first
+        upcoming = sorted(
+            [e for e in er["events"] if e.get("is_upcoming")],
+            key=lambda e: e.get("days_away", 999)
+        )[:6]
+        market_context["events"] = [
+            {
+                "name": e.get("name"),
+                "date": e.get("date"),
+                "days_away": e.get("days_away"),
+                "direction": e.get("direction"),
+                "magnitude": e.get("magnitude"),
+                "impact_pct": e.get("impact_pct"),
+                "affected_channels": e.get("affected_channels", []),
+                "type": e.get("type"),
+            }
+            for e in upcoming
+        ]
+        # Recommendations that ARE in the 90-day window
+        market_context["event_recommendations"] = er.get("recommendations", [])[:5]
+        market_context["data_sources_loaded"].append("events")
+
+    tr = _state.get("trends_result") or {}
+    if tr.get("recommendations"):
+        # Alerts from trends (CPC inflation, CPM shifts, CTR benchmarks)
+        alerts = []
+        for rec in tr.get("recommendations", [])[:5]:
+            alerts.append({
+                "title": rec.get("action_summary") or rec.get("title"),
+                "narrative": rec.get("narrative", "")[:240],
+                "channel": rec.get("channel"),
+                "impact": rec.get("impact", 0),
+            })
+        market_context["trends_alerts"] = alerts
+        market_context["data_sources_loaded"].append("trends")
+
+    cr = _state.get("competitive_result") or {}
+    if cr:
+        # Compact snapshot: our SOV vs top competitor, gap, trend
+        snapshot = {
+            "our_share_of_voice": cr.get("our_share_of_voice"),
+            "top_competitor": cr.get("top_competitor"),
+            "gap_direction": cr.get("gap_direction"),
+            "narrative": cr.get("narrative"),
+        }
+        if any(v is not None for v in snapshot.values()):
+            market_context["competitive_snapshot"] = snapshot
+            market_context["data_sources_loaded"].append("competitive")
+
+    result["market_context"] = market_context
     return _j(result)
 
 
@@ -1264,6 +2126,7 @@ def get_plan(view: str = "client", engagement_id: str = "default",
         response_curves=_state.get("curves") or {},
         engagement_id=engagement_id,
         view=view,
+        bayes_result=_state.get("bayes_result"),
     )
     return _j(plan)
 
@@ -1843,7 +2706,16 @@ def analyst_status():
 # ═══════════════════════════════════════════════
 
 @app.post("/api/adstock")
-def run_adstock(adstock_type: str = "geometric"):
+def run_adstock(adstock_type: str = "auto"):
+    """Fit adstock per channel.
+
+    adstock_type:
+      - "auto" (default): channel-aware — Weibull for broadcast (TV, radio,
+        OOH, events), geometric for digital and direct-response channels.
+        Each channel gets the adstock shape appropriate to its
+        attribution basis.
+      - "geometric" or "weibull": force a single type across all channels.
+    """
     if _state["campaign_data"] is None: raise HTTPException(400, "No data loaded")
     return _j(compute_channel_adstock(_state["campaign_data"], adstock_type))
 

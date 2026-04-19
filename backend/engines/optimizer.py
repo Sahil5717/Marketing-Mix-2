@@ -71,6 +71,109 @@ def _marginal_revenue(spend_annual, curve, extrapolation_cap=DEFAULT_EXTRAPOLATI
         a, b = curve["params"]["a"], curve["params"]["b"]
         return float(a * b * np.power(max(monthly, 1e-6), b - 1))
 
+def _build_capacity_bound_result(
+    response_curves, channels, current_allocation, bounds,
+    total_budget, capacity_warning
+):
+    """Short-circuit result for the over-capacity case.
+
+    When requested budget > sum of per-channel 3x caps, the feasible region
+    collapses to "every channel at its upper bound." Rather than ask SLSQP
+    to rediscover this (it fails with singular-hessian errors when nearly
+    every bound is active), return the allocation directly.
+
+    The per-channel answer is: spend up to the upper bound. Total spend is
+    the sum of those bounds — which is *less* than what the caller
+    requested, but that's the honest answer: we don't know what happens
+    beyond the trusted range.
+    """
+    channel_results = []
+    total_rev = 0.0
+    total_opt_spend = 0.0
+    for i, ch in enumerate(channels):
+        cur = current_allocation.get(ch, 0)
+        hi = bounds[i][1]
+        opt = hi  # Max out every channel
+        opt_rev = _predict_revenue(opt, response_curves[ch])
+        cur_rev = _predict_revenue(cur, response_curves[ch])
+        channel_results.append({
+            "channel": ch,
+            "current_spend": round(cur, 0),
+            "optimized_spend": round(opt, 0),
+            "change_pct": round((opt - cur) / max(cur, 1) * 100, 1),
+            "current_revenue": round(cur_rev, 0),
+            "optimized_revenue": round(opt_rev, 0),
+            "revenue_delta": round(opt_rev - cur_rev, 0),
+            "current_roi": round((cur_rev - cur) / max(cur, 1), 3),
+            "optimized_roi": round((opt_rev - opt) / max(opt, 1), 3),
+            "marginal_roi": 0,
+            "locked": False,
+            "at_extrapolation_cap": True,
+        })
+        total_rev += opt_rev
+        total_opt_spend += opt
+
+    current_total = sum(c["current_revenue"] for c in channel_results)
+    return {
+        "channels": channel_results,
+        "summary": {
+            "total_budget": total_budget,
+            "current_revenue": current_total,
+            "optimized_revenue": total_rev,
+            "revenue_uplift": round(total_rev - current_total, 0),
+            "uplift_pct": round((total_rev - current_total) / max(current_total, 1) * 100, 2),
+            "current_roi": round((current_total - sum(c["current_spend"] for c in channel_results)) / max(sum(c["current_spend"] for c in channel_results), 1), 3),
+            "optimized_roi": round((total_rev - total_opt_spend) / max(total_opt_spend, 1), 3),
+        },
+        "optimizer_info": {
+            "converged": True,
+            "warning": capacity_warning,
+            "warnings": [capacity_warning],
+            "mode": "capacity_bound",
+        },
+    }
+
+
+def _get_channel_constraints(channel_name: str, attribution_basis: str = "click"):
+    """
+    Per-channel execution constraints — how fast this channel can flex
+    budget, what minimum buy is feasible, etc. Real offline media has
+    structural constraints digital doesn't:
+
+      - TV networks sell in weekly/monthly commitments with 4-8 week lead
+        times. Shifting $X into TV next quarter is realistic; shifting
+        next month is not.
+      - Radio has 2-3 week lead time on ad placement, smaller minimum buys
+      - OOH has 6-8 week lead time for new creative, ~4 weeks for rotating
+        existing inventory
+      - Call center is operational — lead time is weeks not months but
+        throughput is capped by headcount
+      - Digital channels can flex spend in days
+
+    Returns a dict with:
+      - swing_cap: max fractional change in one optimization step.
+        0.5 means the channel can move between 50% and 150% of current.
+      - lead_time_weeks: how long before a new allocation can be executed
+      - min_annual_floor: hard floor — don't recommend going below this
+    """
+    # Broadcast offline — slowest to flex, largest minimum buys
+    if channel_name == "tv_national":
+        return {"swing_cap": 0.35, "lead_time_weeks": 8, "min_annual_floor": 500_000}
+    if channel_name == "radio":
+        return {"swing_cap": 0.45, "lead_time_weeks": 3, "min_annual_floor": 120_000}
+    if channel_name == "ooh":
+        return {"swing_cap": 0.40, "lead_time_weeks": 6, "min_annual_floor": 200_000}
+    # Direct-response offline — moderate flexibility
+    if channel_name == "events":
+        return {"swing_cap": 0.30, "lead_time_weeks": 12, "min_annual_floor": 250_000}
+    if channel_name == "direct_mail":
+        return {"swing_cap": 0.50, "lead_time_weeks": 4, "min_annual_floor": 50_000}
+    if channel_name == "call_center":
+        return {"swing_cap": 0.40, "lead_time_weeks": 6, "min_annual_floor": 100_000}
+    # Digital — flexible by design
+    return {"swing_cap": None, "lead_time_weeks": 1, "min_annual_floor": None}
+
+
 def optimize_budget(
     response_curves: Dict,
     total_budget: float,
@@ -174,15 +277,53 @@ def optimize_budget(
     # go below what you're currently spending, or min_spend_pct if you
     # don't have a current number", NOT "spend at least min_spend_pct".
     bounds = []
+    per_channel_constraints = {}  # accumulated for the result payload
     for i, ch in enumerate(channels):
         cur = current_allocation.get(ch, avail / n)
+
+        # Per-channel overrides for offline media.
+        # The attribution_basis is attached to each curve by the response-
+        # curve engine; fall back gracefully if absent.
+        ch_curve = response_curves.get(ch, {}) or {}
+        ch_basis = ch_curve.get("attribution_basis", "click")
+        ch_constraints = _get_channel_constraints(ch, ch_basis)
+        per_channel_constraints[ch] = ch_constraints
+
+        # Offline channels get a tighter swing cap (their lead times and
+        # contractual buys mean they can't flex as fast as digital)
+        channel_swing_cap = ch_constraints["swing_cap"]
+        if channel_swing_cap is not None:
+            this_swing = channel_swing_cap
+        else:
+            this_swing = effective_swing_cap
+
         global_min = avail * min_spend_pct
         global_max = avail * max_spend_pct
-        # Floor: the smaller of global_min and a tight fraction of current.
-        floor = min(global_min, cur * (1.0 - effective_swing_cap))
+        # Floor: normally the smaller of global_min and a tight fraction of
+        # current, to avoid locking a cheap channel at an artificially-high
+        # floor. BUT for channels with a per-channel swing cap (offline
+        # media — TV, radio, etc.), we respect that cap on both sides:
+        # the channel can't move down more than `this_swing` in one step.
+        # Without this, global_min dominates and the optimizer can zero
+        # out a TV buy that the contract says you owe $10M on.
+        has_per_channel_swing = channel_swing_cap is not None
+        if has_per_channel_swing:
+            floor = cur * (1.0 - this_swing)
+        else:
+            floor = min(global_min, cur * (1.0 - this_swing))
         floor = max(floor, 1000.0)  # hard minimum of $1k/yr
+        # For offline channels, enforce the min_annual_floor — media-buy
+        # minimums. You can't contract TV for less than the network's
+        # weekly minimum × 52.
+        if ch_constraints["min_annual_floor"] is not None and cur > 0:
+            # Only raise the floor if current spend already exceeds it —
+            # we don't want to force NEW spend on a channel that's currently
+            # at $0. But if we're running it at $10M, the floor should
+            # reflect what the seller will contract for.
+            if cur >= ch_constraints["min_annual_floor"]:
+                floor = max(floor, ch_constraints["min_annual_floor"])
         # Ceiling: min of three caps -- global, swing, extrapolation.
-        swing_max = cur * (1.0 + effective_swing_cap)
+        swing_max = cur * (1.0 + this_swing)
         extrapolation_max = cur * extrapolation_cap  # same cap _predict_revenue uses
         hi = min(global_max, swing_max, extrapolation_max)
         if hi <= floor:
@@ -208,9 +349,16 @@ def optimize_budget(
             f"historical data at higher spend levels is needed before extrapolating."
         )
         logger.warning(capacity_warning)
-        # Scale the equality constraint down to the absorbable amount so
-        # SLSQP has a feasible problem.
-        avail = max_absorbable * 0.98  # 2% slack for SLSQP numerical tolerance
+        # When avail > max_absorbable, the feasible region collapses to
+        # essentially "every channel at its upper bound." SLSQP struggles
+        # with this (singular hessian, pinned bounds), so short-circuit:
+        # return the upper-bound allocation directly. This is still an
+        # "optimal" answer — there's nowhere else to put the budget within
+        # the extrapolation-safe envelope.
+        return _build_capacity_bound_result(
+            response_curves, channels, current_allocation, bounds,
+            total_budget, capacity_warning
+        )
     elif avail < min_required:
         capacity_warning = (
             f"Requested budget (${avail:,.0f}) is below the sum of per-channel "
@@ -266,19 +414,59 @@ def optimize_budget(
         except Exception as e:
             logger.warning(f"Restart {restart} failed: {e}")
 
+    # If SLSQP failed across all restarts, retry with trust-constr which
+    # handles degenerate cases (singular hessian, near-boundary solutions)
+    # better. Trust-constr is slower but more robust for 12+ channels.
+    if best_result is None or not best_result.success:
+        logger.info("SLSQP failed across restarts; retrying with trust-constr")
+        try:
+            x0_fallback = np.array([current_allocation.get(ch, avail/n) for ch in channels])
+            if x0_fallback.sum() > 0:
+                x0_fallback = x0_fallback * (avail / x0_fallback.sum())
+            x0_fallback = np.clip(x0_fallback, lo_arr, hi_arr)
+            # Re-project onto the sum constraint
+            if abs(x0_fallback.sum() - avail) > 1e-3:
+                x0_fallback = x0_fallback * (avail / max(x0_fallback.sum(), 1e-9))
+                x0_fallback = np.clip(x0_fallback, lo_arr, hi_arr)
+            res_tc = minimize(neg_objective, x0_fallback, method="trust-constr",
+                              bounds=bounds, constraints=constraints,
+                              options={"maxiter": 300, "xtol": 1e-8})
+            if res_tc.fun < best_obj and res_tc.success:
+                best_obj = res_tc.fun
+                best_result = res_tc
+        except Exception as e:
+            logger.warning(f"trust-constr fallback also failed: {e}")
+
     if best_result is None or not best_result.success:
         logger.warning(f"Optimization did not converge: {best_result}")
-        # Return current allocation as-is (no change) so downstream engines don't crash
+        # Smarter fallback: proportionally scale current allocation to
+        # hit the requested budget. This respects the constraint and
+        # is a better answer than "return current unchanged" — if the
+        # user asked for more budget, give them at least a proportional
+        # scale-up rather than silently reporting current revenue.
         channel_results = []
-        for ch in channels:
+        cur_spend_vec = np.array([current_allocation.get(ch, avail/n) for ch in channels])
+        cur_total = cur_spend_vec.sum()
+        if cur_total > 0:
+            scale = avail / cur_total
+            proportional = np.clip(cur_spend_vec * scale, lo_arr, hi_arr)
+        else:
+            proportional = np.full(n, avail / n)
+
+        for i, ch in enumerate(channels):
             cur = current_allocation.get(ch, avail/n)
+            opt = float(proportional[i])
             cur_rev = _predict_revenue(cur, response_curves[ch])
-            mROI = _marginal_revenue(cur, response_curves[ch])
+            opt_rev = _predict_revenue(opt, response_curves[ch])
+            mROI = _marginal_revenue(opt, response_curves[ch])
             channel_results.append({
-                "channel": ch, "current_spend": round(cur, 0), "optimized_spend": round(cur, 0),
-                "change_pct": 0, "current_revenue": round(cur_rev, 0), "optimized_revenue": round(cur_rev, 0),
-                "revenue_delta": 0, "current_roi": round((cur_rev-cur)/max(cur,1), 3),
-                "optimized_roi": round((cur_rev-cur)/max(cur,1), 3), "marginal_roi": round(mROI, 4), "locked": False,
+                "channel": ch, "current_spend": round(cur, 0), "optimized_spend": round(opt, 0),
+                "change_pct": round((opt - cur) / max(cur, 1) * 100, 1),
+                "current_revenue": round(cur_rev, 0), "optimized_revenue": round(opt_rev, 0),
+                "revenue_delta": round(opt_rev - cur_rev, 0),
+                "current_roi": round((cur_rev-cur)/max(cur,1), 3),
+                "optimized_roi": round((opt_rev-opt)/max(opt,1), 3),
+                "marginal_roi": round(mROI, 4), "locked": False,
             })
         for ch, sp in locked.items():
             if ch in response_curves and "error" not in response_curves[ch]:
@@ -287,12 +475,24 @@ def optimize_budget(
                     "change_pct":0,"current_revenue":round(rev,0),"optimized_revenue":round(rev,0),
                     "revenue_delta":0,"current_roi":round((rev-sp)/max(sp,1),3),
                     "optimized_roi":round((rev-sp)/max(sp,1),3),"marginal_roi":0,"locked":True})
-        total_rev = sum(c["current_revenue"] for c in channel_results)
+        total_opt_rev = sum(c["optimized_revenue"] for c in channel_results)
+        total_cur_rev = sum(c["current_revenue"] for c in channel_results)
+        fail_warnings = ["Optimizer did not converge; showing a proportional scale-up as a directional answer."]
+        if capacity_warning:
+            fail_warnings.insert(0, capacity_warning)
         return {"channels": channel_results, "summary": {
-            "total_budget": total_budget, "current_revenue": total_rev, "optimized_revenue": total_rev,
-            "revenue_uplift": 0, "uplift_pct": 0, "current_roi": round((total_rev-total_budget)/max(total_budget,1),3),
-            "optimized_roi": round((total_rev-total_budget)/max(total_budget,1),3),
-        }, "optimizer_info": {"converged": False, "warning": "SLSQP did not converge. Showing current allocation."}}
+            "total_budget": total_budget, "current_revenue": total_cur_rev,
+            "optimized_revenue": total_opt_rev,
+            "revenue_uplift": round(total_opt_rev - total_cur_rev, 0),
+            "uplift_pct": round((total_opt_rev - total_cur_rev) / max(total_cur_rev, 1) * 100, 2),
+            "current_roi": round((total_cur_rev - sum(c["current_spend"] for c in channel_results)) / max(sum(c["current_spend"] for c in channel_results), 1), 3),
+            "optimized_roi": round((total_opt_rev - sum(c["optimized_spend"] for c in channel_results)) / max(sum(c["optimized_spend"] for c in channel_results), 1), 3),
+        }, "optimizer_info": {
+            "converged": False,
+            "warning": fail_warnings[0],
+            "warnings": fail_warnings,
+            "mode": "proportional_scale",
+        }}
 
     opt_spend = best_result.x
 
@@ -312,6 +512,9 @@ def optimize_budget(
             "current_roi": round((cur_rev-cur)/max(cur,1), 3),
             "optimized_roi": round((opt_rev-opt)/max(opt,1), 3),
             "marginal_roi": round(mROI, 4), "locked": False,
+            # Execution constraints for this channel — surface them so the
+            # Plan/Roadmap screens can show lead times and honest expectations.
+            "constraints": per_channel_constraints.get(ch, {}),
         })
     # Add locked channels
     for ch, sp in locked.items():
@@ -411,11 +614,21 @@ def optimize_budget(
     }
 
 def sensitivity_analysis(response_curves, base_budget, objective="balanced", steps=None):
-    """Run optimizer at multiple budget levels to show sensitivity."""
+    """Run optimizer at multiple budget levels to show sensitivity.
+
+    Each budget step uses a deterministic seed so the results are
+    reproducible across calls with the same inputs. Without this, the
+    multi-restart Dirichlet sampling inside optimize_budget produces
+    slightly different local optima at adjacent budget levels, which
+    can cause the revenue-vs-budget curve to dip at a few points even
+    though theory says it should be monotonic.
+    """
     if steps is None: steps = [-30, -20, -10, 0, 10, 20, 30, 50]
     results = []
-    for pct in steps:
+    for i, pct in enumerate(steps):
         budget = base_budget * (1 + pct/100)
+        # Fixed seed per step for reproducibility
+        np.random.seed(42 + i)
         opt = optimize_budget(response_curves, budget, objective)
         if "error" not in opt:
             results.append({"budget_change_pct": pct, "budget": round(budget,0),

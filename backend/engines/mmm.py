@@ -187,8 +187,16 @@ def fit_bayesian_mmm(data, n_draws=1000, n_tune=500, n_chains=4, target_accept=0
     # Channel contributions in dollars.
     contributions = {}
     total_media = 0.0
+    # Keep raw posterior samples of betas/decays/hs in memory so we can
+    # compute per-channel ROAS HDIs below. These arrays are (n_chain, n_draw, n_ch).
+    beta_samples_flat = beta_samples.reshape(-1, len(channels))
+    decay_samples_flat = decay_samples.reshape(-1, len(channels))
+    hs_samples_flat = hs_samples.reshape(-1, len(channels))
+    n_draws_total = beta_samples_flat.shape[0]
+
     for c, ch in enumerate(channels):
         spend = data["spend_matrix"][ch]
+        spend_total = float(spend.sum())
         ad = geometric_adstock(spend_normed[:, c], float(decay_means[c]))
         sat = hill_saturation(ad, max(float(hs_means[c]), 1e-6))
         contrib_dollars = max(
@@ -202,15 +210,49 @@ def fit_bayesian_mmm(data, n_draws=1000, n_tune=500, n_chains=4, target_accept=0
             float(beta_hdi_scaled[c, 0]) * rev_scale,
             float(beta_hdi_scaled[c, 1]) * rev_scale,
         ]
+
+        # --- Per-draw ROAS and contribution computation ---
+        # For each posterior draw, recompute the full saturation path using
+        # THAT draw's decay and half-saturation, then contribution = beta * sum(sat).
+        # ROAS = contribution / spend_total. Take 5th/95th percentiles for 90% HDI.
+        #
+        # Without this, the UI has no honest uncertainty around ROAS — only
+        # a parameter-level HDI on beta, which isn't what a CMO asks to see.
+        # This loop is cheap: ~600 draws × 6 channels × 48 periods = 170k ops.
+        contrib_draws = np.empty(n_draws_total)
+        roas_draws = np.empty(n_draws_total)
+        for d in range(n_draws_total):
+            ad_d = geometric_adstock(spend_normed[:, c], float(decay_samples_flat[d, c]))
+            sat_d = hill_saturation(ad_d, max(float(hs_samples_flat[d, c]), 1e-6))
+            contrib_d = max(
+                0.0,
+                float(beta_samples_flat[d, c]) * float(sat_d.sum()) * rev_scale,
+            )
+            contrib_draws[d] = contrib_d
+            roas_draws[d] = contrib_d / max(spend_total, 1.0)
+        roas_hdi_low = float(np.percentile(roas_draws, 5))
+        roas_hdi_high = float(np.percentile(roas_draws, 95))
+        roas_mean_draws = float(roas_draws.mean())
+        contrib_hdi_low = float(np.percentile(contrib_draws, 5))
+        contrib_hdi_high = float(np.percentile(contrib_draws, 95))
+
         contributions[ch] = {
             "contribution": round(contrib_dollars, 0),
+            "contribution_hdi_90": [round(contrib_hdi_low, 0), round(contrib_hdi_high, 0)],
             "beta_mean": round(beta_dollar, 4),
             "beta_std": round(float(beta_stds_scaled[c]) * rev_scale, 4),
             "beta_hdi_90": [round(hdi_dollar[0], 4), round(hdi_dollar[1], 4)],
             "decay_mean": round(float(decay_means[c]), 3),
             "decay_std": round(float(decay_stds[c]), 3),
             "half_saturation": round(float(hs_means[c]), 4),
-            "spend": round(float(spend.sum()), 0),
+            "spend": round(spend_total, 0),
+            # ROAS HDI from the full joint posterior — not beta / spend,
+            # but the proper marginal distribution of contribution/spend
+            # accounting for uncertainty in beta, decay, and saturation
+            # jointly. This is what the UI surfaces as "ROAS: X± Y".
+            "mmm_roas": round(contrib_dollars / max(spend_total, 1.0), 2),
+            "mmm_roas_mean_posterior": round(roas_mean_draws, 2),
+            "mmm_roas_hdi_90": [round(roas_hdi_low, 2), round(roas_hdi_high, 2)],
             "_spend_scale": float(spend_scales[c]),
         }
 
@@ -219,13 +261,74 @@ def fit_bayesian_mmm(data, n_draws=1000, n_tune=500, n_chains=4, target_accept=0
     r2 = float(r2_score(revenue, y_pred))
     mape = float(mean_absolute_percentage_error(revenue, y_pred) * 100)
 
+    # --- Bayesian response curves with 80% HDI band ---
+    # For each channel, build a spend → revenue curve evaluating the full
+    # joint posterior at each spend point. The curve's MIDDLE is the
+    # posterior median; the SHADED BAND is the 10th/90th percentiles.
+    #
+    # These are "marginal" response curves — they show the per-channel
+    # effect assuming a single month of spend at that level (vs the
+    # multi-period adstock-aware sum used for total contribution).
+    # Honest framing for the UI: "expected revenue at this monthly spend,
+    # given all we know about decay and saturation."
+    #
+    # Grid: 30 spend points from 0 to 1.5× observed max. Cheap since the
+    # per-draw computation is just one adstock+saturation evaluation.
+    CURVE_POINTS = 30
+    for c, ch in enumerate(channels):
+        cc = contributions[ch]
+        spend = data["spend_matrix"][ch]
+        spend_max = float(spend.max())
+        spend_scale_c = spend_scales[c]
+        # Build a spend grid in RAW dollars (for UI display) and in normalized
+        # space (for computation, matching the model)
+        x_grid_raw = np.linspace(0, spend_max * 1.5, CURVE_POINTS)
+        x_grid_normed = x_grid_raw / spend_scale_c
+
+        # For each draw, compute revenue = beta * hill_sat(adstock_one_period(x, decay), hs)
+        # Simplification: "one period" adstock on a single-month spend reduces to just
+        # sat(x/scale, hs) since adstock of a single-period signal is itself.
+        # So curve_draws[d, i] = beta[d] * sat(x_grid_normed[i], hs[d]) * rev_scale
+        curve_matrix = np.empty((n_draws_total, CURVE_POINTS))
+        for d in range(n_draws_total):
+            hs_d = max(float(hs_samples_flat[d, c]), 1e-6)
+            beta_d = float(beta_samples_flat[d, c])
+            # Hill saturation: x / (hs + x)
+            sat_vals = x_grid_normed / (hs_d + x_grid_normed)
+            curve_matrix[d, :] = beta_d * sat_vals * rev_scale
+
+        # Point estimate curve at the posterior mean params
+        curve_mid = np.percentile(curve_matrix, 50, axis=0)
+        curve_low = np.percentile(curve_matrix, 10, axis=0)
+        curve_high = np.percentile(curve_matrix, 90, axis=0)
+
+        cc["response_curve"] = [
+            {
+                "spend": round(float(x_grid_raw[i]), 0),
+                "revenue": round(float(curve_mid[i]), 0),
+                "revenue_hdi_low": round(float(curve_low[i]), 0),
+                "revenue_hdi_high": round(float(curve_high[i]), 0),
+            }
+            for i in range(CURVE_POINTS)
+        ]
+        cc["current_monthly_spend"] = round(float(spend.mean()), 0)
+
     for ch in channels:
         cc = contributions[ch]
         cc["contribution_pct"] = round(cc["contribution"] / max(total_rev, 1) * 100, 1)
-        cc["mmm_roas"] = round(cc["contribution"] / max(cc["spend"], 1), 2)
-        # Confidence tier from CI width relative to point estimate.
-        ci_w = cc["beta_std"] / max(cc["beta_mean"], 1e-6)
-        cc["confidence"] = "High" if ci_w < 0.25 else ("Medium" if ci_w < 0.5 else "Low")
+        # mmm_roas already set above — keep it for backward-compat consumers.
+        # Confidence tier: now driven by ROAS HDI width (more honest than beta
+        # CI width). HDI narrow relative to mean = High, wider = Medium, very
+        # wide or straddles zero = Low.
+        roas_lo, roas_hi = cc.get("mmm_roas_hdi_90", [0, 0])
+        roas_mid = cc.get("mmm_roas", 1e-6)
+        hdi_rel_width = (roas_hi - roas_lo) / max(abs(roas_mid), 1e-6)
+        if hdi_rel_width < 0.4:
+            cc["confidence"] = "High"
+        elif hdi_rel_width < 0.9:
+            cc["confidence"] = "Medium"
+        else:
+            cc["confidence"] = "Low"
 
     converged = rhat_max < 1.05 and ess_min > 100
     return {
@@ -617,7 +720,7 @@ def fit_mle_mmm(data):
         "periods": [str(p) for p in data["periods"]],
     }
 
-def run_mmm(df, method="auto", n_draws=500):
+def run_mmm(df, method="auto", n_draws=500, n_chains=4, n_tune=None):
     """Public API: Bayesian → MLE → OLS fallback chain.
 
     n_draws defaults to 500 (with 500 tune and 4 chains = 2000 post-tune
@@ -625,6 +728,10 @@ def run_mmm(df, method="auto", n_draws=500):
     counts we typically see (~8 channels, ~48 periods) while keeping a
     single fit under ~90 seconds on a dev laptop. Pass a larger n_draws
     if you need tighter HDI intervals for a final report.
+
+    n_chains / n_tune: passthrough knobs for the Bayesian fit. Useful
+    when the caller knows they only need a quick directional answer
+    (e.g., background demo fits use n_chains=2, n_tune=300).
     """
     data = prepare_mmm_data(df)
     if data["n_periods"]<6: logger.warning(f"Only {data['n_periods']} periods — MMM needs 12+ for reliability")
@@ -637,7 +744,10 @@ def run_mmm(df, method="auto", n_draws=500):
     if method == "auto":
         if T >= 24:
             try:
-                candidate = fit_bayesian_mmm(data, n_draws=n_draws)
+                bayes_kwargs = {"n_draws": n_draws, "n_chains": n_chains}
+                if n_tune is not None:
+                    bayes_kwargs["n_tune"] = n_tune
+                candidate = fit_bayesian_mmm(data, **bayes_kwargs)
                 diag = candidate["model_diagnostics"]
                 # Only accept Bayesian if the chains actually converged. A
                 # Bayesian result with r-hat > 1.05 or ESS < 100 is worse than
@@ -676,7 +786,10 @@ def run_mmm(df, method="auto", n_draws=500):
                 f"OLS MMM: R²={result['model_diagnostics']['r_squared']:.3f}"
             )
     elif method == "bayesian":
-        result = _finalize(fit_bayesian_mmm(data, n_draws=n_draws))
+        bayes_kwargs = {"n_draws": n_draws, "n_chains": n_chains}
+        if n_tune is not None:
+            bayes_kwargs["n_tune"] = n_tune
+        result = _finalize(fit_bayesian_mmm(data, **bayes_kwargs))
     elif method == "mle":
         result = _finalize(fit_mle_mmm(data))
     elif method == "ols":

@@ -5,6 +5,7 @@ import {
   ensurePlanReady,
   ensureScenarioReady,
   ensureChannelDetailReady,
+  ensureMarketContextReady,
   saveCommentary,
   deleteCommentary,
   suppressFinding,
@@ -12,11 +13,16 @@ import {
   getStoredAuth,
   setUnauthorizedHandler,
   logout,
+  fetchEngagements,
+  fetchBayesStatus,
+  refitBayes,
 } from "./api.js";
 import { Diagnosis } from "./screens/Diagnosis.jsx";
 import { Plan } from "./screens/Plan.jsx";
 import { Scenarios } from "./screens/Scenarios.jsx";
 import { AnalystHub } from "./screens/AnalystHub.jsx";
+import { MarketContext } from "./screens/MarketContext.jsx";
+import { Engagements } from "./screens/Engagements.jsx";
 // Lazy-load ChannelDetail + Recharts — see DiagnosisApp for rationale.
 const ChannelDetail = lazy(() =>
   import("./screens/ChannelDetail.jsx").then((m) => ({ default: m.ChannelDetail }))
@@ -42,9 +48,11 @@ function getScreenFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const s = params.get("screen");
   if (s === "hub" || s === "tools" || s === "dashboard") return "hub";
+  if (s === "engagements" || s === "engagement") return "engagements";
   if (s === "plan") return "plan";
   if (s === "scenarios") return "scenarios";
   if (s === "channels" || s === "channel") return "channels";
+  if (s === "market" || s === "market-context") return "market";
   return "diagnosis";
 }
 
@@ -70,12 +78,18 @@ export default function EditorApp() {
   const [toast, setToast] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [auth, setAuth] = useState(null);
+  // Active engagement meta for the header chip. Fetched once on mount
+  // and refreshed after the Engagements screen switches active. If the
+  // fetch fails (demo backend not ready yet), fall back to default copy.
+  const [activeEngagement, setActiveEngagement] = useState(null);
+  // Bayesian MMM status (polled). The chip in AppHeader shows this live.
+  // Null until first fetch. See the polling useEffect below for semantics.
+  const [bayesStatus, setBayesStatus] = useState(null);
 
   const reload = useCallback(async () => {
-    // Hub manages its own state (it's the analyst workspace, works with
-    // whatever the backend currently has loaded). Don't force an analysis
-    // fetch just to render this screen.
-    if (screen === "hub") {
+    // Hub and Engagements manage their own state — they don't need the
+    // full analysis pipeline to render.
+    if (screen === "hub" || screen === "engagements") {
       setState({ status: "ready", data: null, error: null });
       return;
     }
@@ -83,6 +97,8 @@ export default function EditorApp() {
     if (screen === "channels") {
       const channelSlug = getChannelFromUrl();
       dataResult = await ensureChannelDetailReady(channelSlug);
+    } else if (screen === "market") {
+      dataResult = await ensureMarketContextReady();
     } else {
       const loader =
         screen === "plan" ? ensurePlanReady :
@@ -114,7 +130,52 @@ export default function EditorApp() {
     setAuth(stored);
     setUnauthorizedHandler(redirectToLogin);
     reload();
-  }, [reload]);
+
+    // Fetch active engagement for the header chip. Runs once on mount
+    // (re-runs when user comes back from the Engagements screen since
+    // screen is a dep). Failure is non-fatal — header falls back to
+    // default copy.
+    fetchEngagements().then(({ data }) => {
+      if (!data) return;
+      const active = (data.engagements || []).find(
+        (e) => e.id === data.active_engagement_id
+      );
+      if (active) setActiveEngagement(active);
+    });
+  }, [reload, screen]);
+
+  // Bayesian MMM status polling. Fast polls (5s) while pending/running,
+  // slow polls (30s) otherwise. Separate from screen-change effects so
+  // the chip keeps pulsing across navigation.
+  useEffect(() => {
+    // Kick an immediate fetch on mount so the chip hydrates without
+    // waiting for the first interval tick.
+    let cancelled = false;
+    const poll = async () => {
+      const { data } = await fetchBayesStatus();
+      if (!cancelled && data) {
+        setBayesStatus(data);
+      }
+    };
+    poll();
+
+    // Adaptive interval: bayesStatus.state drives speed.
+    const currentState = bayesStatus?.state;
+    const isActive = currentState === "pending" || currentState === "running" || currentState == null;
+    const intervalMs = isActive ? 5000 : 30000;
+
+    const id = setInterval(poll, intervalMs);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [bayesStatus?.state]);
+
+  // Manual Bayesian refresh handler (bound to the chip's click when ready)
+  const handleBayesRefresh = useCallback(async () => {
+    const { data } = await refitBayes();
+    if (data) setBayesStatus(data);
+  }, []);
 
   // ── Editor action handlers ──
   //
@@ -217,7 +278,17 @@ export default function EditorApp() {
         currentScreen={screen}
         auth={auth}
         editorMode={true}
-        engagementMeta={{ client: "Acme Retail", period: "FY 2025", updated: "12 Apr 2026" }}
+        engagementMeta={
+          activeEngagement
+            ? {
+                client: activeEngagement.client,
+                period: activeEngagement.period,
+                updated: activeEngagement.last_updated || "",
+              }
+            : { client: "Acme Retail", period: "FY 2025", updated: "" }
+        }
+        bayesStatus={bayesStatus}
+        onBayesRefresh={handleBayesRefresh}
         onSignOut={() => { logout(); redirectToLogin(); }}
         onShare={() => {
           const url = window.location.href;
@@ -246,10 +317,20 @@ export default function EditorApp() {
       {state.status === "ready" && screen === "hub" && (
         <AnalystHub onAnalysisComplete={() => reload()} />
       )}
+      {state.status === "ready" && screen === "engagements" && (
+        <Engagements
+          onNavigateToWorkspace={() => {
+            window.location.search = "?screen=hub";
+          }}
+        />
+      )}
       {state.status === "ready" && screen === "channels" && (
         <Suspense fallback={<LoadingView />}>
           <ChannelDetail data={state.data} />
         </Suspense>
+      )}
+      {state.status === "ready" && screen === "market" && (
+        <MarketContext data={state.data} />
       )}
 
       <Footer />

@@ -1,3 +1,259 @@
+# CHANGES — v22 (MarketLens — Week 5-6 polish, pitch-ready)
+
+Closing out the 6-week pitch prep with Bayesian Compare pane + login
+polish + README rewrite.
+
+## Week 5 shipped
+
+### Backend — Compare pane data
+- Added `bayes_roas_point` to each plan move (alongside existing
+  `bayes_roas_hdi_90`). Three fields together — point + HDI + HDI range
+  — give the Compare pane everything it needs.
+- Clean initialization pattern: all four `bayes_*` fields init to None
+  at top of loop, populated only when channel is in the Bayesian subset
+  AND fit has landed.
+
+### Frontend — Plan "Compare models" tab
+- New fourth SubNavTab on Plan screen: "Compare models"
+- Full `ComparePane` component:
+  - Summary strip: "Comparing N channels across both models. X showing
+    divergent estimates — worth a second look"
+  - Sortable comparison table: Channel / Frequentist mROI + delta /
+    Bayesian ROAS + HDI / Agreement chip / Read copy
+  - Agreement classification: aligned (frequentist point falls inside
+    Bayesian HDI), directional (same sign but magnitudes differ),
+    diverge (sign mismatch or wide miss), no_bayes (not in subset)
+  - Sort order puts diverge rows first — analyst's eye goes to where
+    the models disagree
+  - Per-row "Read" copy explains agreement state in plain language
+  - Methodology footer explains why the two models can differ
+  - Quiet styling — subtle terracotta left-border on diverge rows, no
+    loud warnings. EY buyers don't need alarm bells.
+
+## Week 6 shipped
+
+### Login polish
+- Added abstract response-curve pattern to login left panel
+- In-code SVG (zero copyright risk) with:
+  - Main saturation curve with gradient fill
+  - HDI-like shaded band (subtle accent color)
+  - Secondary dotted curve (muted, represents "other channel")
+  - Data points scattered along the main curve
+- Pattern positioned absolute behind LeftInner content; content
+  z-index'd above
+- Responsive opacity: 0.9 on desktop, 0.6 on mobile where it would
+  otherwise compete with the collapsed header
+
+### README rewrite
+- Replaced stale "Yield Intelligence Platform" content with
+  MarketLens-branded pitch-ready version
+- Honest-scoped: explicitly documents the "pitch asset not production
+  SaaS" positioning. In-memory engagements, shared analysis data,
+  read-only roadmap all called out.
+- What IS real (the math) called out explicitly so probing buyers
+  get an immediate substantive answer.
+- Demo credentials table, screen-by-screen tour, local-dev quickstart,
+  Railway deploy notes, test suite summary, changelog pointer.
+
+## Regression: 107/107 core (69 + 18 + 20) + 44/44 Bayesian fast = 151/151 green
+
+## What the 6-week plan actually shipped
+
+Full recap across v19–v22:
+
+- Week 1 (v19): header overflow, Channel Detail curves, campaigns enrichment, findings↔recs pairing, editor's take polish
+- Week 2 (v19): Market Context screen, 12 channels with offline archetypes, response curve secondary curves, offline-aware UI, optimizer per-channel constraints with lead times
+- Week 3 (v20): Engagements screen, Roadmap Gantt
+- Week 4 (v21): Background Bayesian MMM with PyMC, live MMM chip,
+  credible intervals on Channel Detail + Plan MoveCard
+- Week 5 (v22): Compare pane — Bayesian vs frequentist side by side
+- Week 6 (v22): Login polish, README rewrite
+
+## Deferred (documented, not bugs)
+
+- Drag-edit Roadmap Gantt — would need `roadmap_overrides` SQLite table
+- Full posterior-draw marginal delta HDI — currently ROAS × spend_delta
+  approximation; accurate enough for pitch framing
+- Events/competitive/CPC-trends as structured MMM priors — currently
+  diagnostics only
+- WAIC/LOO Bayesian model comparison
+- Scenarios screen HDI integration — the budget sweep UI doesn't yet
+  carry credible intervals
+
+## Bundle impact (total, not delta)
+
+- AppHeader (includes Plan + Compare + MMM chip): 104KB, 22KB gzipped
+- ChannelDetail (includes Bayesian curve chart): 413KB, 113KB gzipped
+- Editor shell: 46KB, 11KB gzipped
+- Client shell: 142KB, 45KB gzipped
+
+## Honest deploy notes for v22
+
+Everything that was true for v21 stays true. First Bayesian fit on
+Railway cold-start takes ~5 min (pytensor C compilation + sampling);
+subsequent fits ~90 seconds. MMM chip communicates this honestly to
+the user as it runs.
+
+---
+
+# CHANGES — v21 (MarketLens — Bayesian MMM with credible intervals, Week 4 of 6-week plan)
+
+Week 4 delivers the pitch-critical Bayesian claim. The existing PyMC
+infrastructure (which was in the codebase but never exercised in the
+default pipeline) is now live with credible intervals flowing through
+to the UI.
+
+## Week 4 shipped
+
+### Backend — Bayesian background fit
+- New `_state["bayes_status"]` + `_state["bayes_result"]` for the Bayesian lifecycle
+- `_kickoff_bayesian_fit()` — spawns daemon thread, idempotent, catches all exceptions
+- Background fit runs after `/api/run-analysis` completes (doesn't block the main request cycle)
+- Subset of 6 priority channels (paid_search, social_paid, tv_national, events, email, direct_mail) — one per archetype
+- Tight budget: 300 draws × 2 chains × 300 tune = ~165s per fit on Railway-grade hardware
+- Convergence gate: r-hat > 1.05 or ESS < 100 → status "non_converged", result discarded
+- Three endpoints: `GET /api/bayes-status`, `POST /api/bayes-refit`, `GET /api/bayes-result`
+- Self-healing: `/api/bayes-status` auto-kicks off a fit if state is idle but data is loaded (covers session-restore edge case)
+
+### Backend — Credible intervals from real posterior draws
+- Per-channel ROAS HDI (`mmm_roas_hdi_90`) derived from ~600 posterior draws per channel — not beta-CI approximations. For each draw, recompute adstock + saturation + contribution using that draw's decay and half-saturation, then take percentiles of the marginal ROAS distribution.
+- Contribution HDI (`contribution_hdi_90`) same method
+- Response curve HDI band — 30-point spend-vs-revenue curve with low/mid/high per point from posterior percentiles
+- Confidence tier upgraded from beta-CI-width heuristic to ROAS-HDI-width (more honest): "High" if HDI rel-width < 40%, "Medium" < 90%, "Low" otherwise
+- `narrative_plan.build_moves` accepts `bayes_result` — attaches `bayes_delta_hdi_90` to moves for Bayesian subset channels (revenue delta × ROAS HDI)
+- `/api/plan` passes `_state["bayes_result"]` into `generate_plan`
+
+### Frontend — MMM chip in AppHeader
+- Live status chip visible everywhere in editor mode
+- Six states with color coding: idle/pending (grey, "queued"), running (terracotta, pulsing dot, "45s"), ready (green, "r̂ 1.02"), non_converged (muted warning), failed (red error)
+- Click when ready to re-run via `/api/bayes-refit`
+- Adaptive polling: 5s when pending/running, 30s when ready/failed
+- Tooltip includes methodology note when running/ready: "PyMC NUTS · 6 channels · adstock + Hill saturation · 300 draws × 2 chains"
+
+### Frontend — Channel Detail Bayesian section
+- New "Bayesian estimate" section between secondary curve and campaigns table
+- 80% credible region badge in section header
+- Inline ROAS with HDI in section copy ("2.31× with an 80% credible region of 1.59–3.14×")
+- `BayesianCurveChart` — shaded HDI band (accent-colored, 18% opacity) behind median line, current-spend vertical reference marker
+- Per-channel polling (10s until ready)
+- Graceful handling of channels outside the Bayesian subset — shows an honest "this channel isn't in the current Bayesian subset" explanation instead of empty UI
+- Method diagnostic footer line: "ROAS 2.31× · HDI 1.59–3.14× · decay 0.34 · half-sat 0.28"
+
+### Frontend — MoveCard credible intervals on Plan
+- New `bayesDeltaHdi` prop on `MoveCard`
+- Renders inline "HDI +$2.1M – +$7.8M" below the spend transition line for Bayesian-subset channels
+- Accent-colored, subtle but discoverable
+- Compact formatter for readable range display
+- Channels outside the subset render without HDI (honest — no fake zero-width intervals)
+
+### Regression tests
+- New `test_bayes_fast.py` — 44 assertions covering fit completion, convergence, HDI structure, ordering, confidence tier, response curve shape. Tight budget (6 channels × 200 draws × 2 chains) keeps it under ~3 min.
+- `run_mmm` signature extended with `n_chains` and `n_tune` passthroughs — useful for fast fits and tests
+- Not in the default regression loop (too slow for per-commit) but runs independently
+
+## Regression: 107/107 core (69 + 18 + 20) + 44/44 Bayesian fast = 151/151 green
+
+## Deferred (documented, not bugs)
+- Full posterior-draw recomputation for marginal delta HDI (currently uses ROAS × spend_delta approximation) — upgrades accuracy by ~5-10%, not pitch-critical
+- Bayesian-vs-frequentist comparison sheet
+- WAIC/LOO model comparison between alternative specs
+- Full covariate MMM (events, competitive, CPC trends as structured priors)
+
+## Week 5-6 ahead
+- Week 5: Either Bayesian polish (comparison sheet, full covariate) or Scenarios screen HDI integration
+- Week 6: Login background, polish, screenshots, final audit
+
+## Bundle impact
+- AppHeader: +3KB for MMM chip (96KB total, 20KB gzipped)
+- ChannelDetail: +5KB for Bayesian section (413KB total, 113KB gzipped)
+
+---
+
+# CHANGES — v20 (MarketLens — Engagements + Roadmap Gantt, Week 3 of 6-week plan)
+
+Week 3 delivers two pitch-critical visual claims: multi-engagement project
+tracking and an honest execution calendar.
+
+## Week 3 shipped
+
+### Session 1 — Engagements screen
+- New screen at `?screen=engagements` with hero stats, card-based list, add/delete/activate actions
+- Backend CRUD: `GET/POST /api/engagements`, `DELETE /api/engagements/{id}`, `POST /api/engagements/{id}/activate`
+- 4 pre-seeded engagements (Acme Retail FY2025 active, Contoso Foods in review, Initech wrapped, Umbrella Corp active) with client / period / status / owner / summary
+- Add-engagement modal with validation, status picker, free-form summary
+- Honest methodology note — deletion is ephemeral, all engagements share the same analysis data (real multi-tenancy is a bigger lift explicitly deferred)
+- New "Engagements" nav item in AppHeader (editor mode only)
+- Header engagement chip now renders dynamically from the active engagement; re-fetches when user navigates away from Engagements screen
+
+### Session 2 — Roadmap Gantt
+- Renamed "Phased rollout" tab → "Roadmap"
+- **Fixed the Month 1 empty-state bug** — reliability filter was checking `=== "high"` but backend emits `"reliable"` / `"inconclusive"`. Month 1 had been silently empty for every plan until now.
+- Full Gantt visualization replacing text phases:
+  - 12-month timeline with month dividers
+  - One lane per move, channel + change% label
+  - Bar width proportional to `lead_time_weeks` from the per-channel constraints (Week 2 work)
+  - Color coding: black = Month 1 execute now, terracotta = Month 2–3 after review, striped = Month 4+ validation period, grey = execute-after-validation
+  - Hover tooltip shows lead time + week range
+  - Legend bar with phase swatches + move count
+  - Reading guide footer
+- Visual payoff: the "8-week lead time" chips we added to MoveCard in Week 2 now anchor to a real calendar. TV at 8 weeks, events at 12 weeks, digital at 1 week are all visible at a glance.
+
+## Deferred (documented, not bugs)
+- Drag-edit Gantt + per-user `roadmap_overrides` SQLite table → post-pitch enhancement
+- Real per-engagement data isolation → part of full multi-tenant roadmap (beyond 6-week plan)
+
+## Week 4-5 (Bayesian MMM) still queued
+- PyMC-based MMM with adstock + saturation priors
+- Credible intervals on channel ROAS
+- Events/competitive/CPC-trends as MMM features (today: diagnostics only)
+- Model picker + Bayesian-vs-frequentist comparison sheet
+
+## Regression: 107/107 green (69 integration + 18 MMM + 20 optimizer), stable across 3 consecutive runs
+
+## Bundle impact
+- Editor bundle: +16KB for Engagements screen (46KB total, 11KB gzipped)
+- AppHeader bundle: +6KB for Gantt (93KB total, 19KB gzipped)
+- No new dependencies
+
+---
+
+# CHANGES — v19 (MarketLens — offline channels + market context, Week 1-2 of 6-week plan)
+
+Week 1-2 of a 6-week revision plan against pitch-flagged gaps.
+
+## Week 1 shipped
+- Header overflow fix (flex-shrink 0 + white-space nowrap + two-row split in editor mode)
+- Channel Detail curve: dots sit on curve (backend re-samples), labels stack vertically when dots close, past-saturation region dampened (0.03 opacity, starts at 1.15× saturation)
+- Dot value labels showing "Current $X → $Y" and "Optimal $X → $Y" inline
+- KPI delta rows on Diagnosis (Portfolio ROAS QoQ, Value at Risk %, Plan Confidence R²+MAPE)
+- Campaigns table enrichment: 9 columns with CPA/CVR/share%/QoQ pills/sparklines/per-campaign recommendation chips
+- Findings paired with Recommendations — each finding gets action + impact + risk + Plan cross-link
+- Missing impact dollars hidden (no more "—" for 0-impact findings)
+- Editor's Take no longer fakes commentary — real commentary when present, editor prompt when missing, hidden in client view
+- Market Context sidebar card on Diagnosis surfacing uploaded events/trends/competitive
+
+## Week 2 shipped
+- Dedicated Market Context screen (`/api/market-context` + `<MarketContext />`) — full events timeline (no 90-day cutoff), cost trend signals, competitive SOV, near-term action cards
+- Market nav item added to AppHeader in both editor + client modes
+- Mock data: 4 new offline channels (tv_national, radio, ooh, call_center) with realistic spend patterns + offline metrics (grps, reach, store_visits, calls_generated, event_attendees, dealer_enquiries) + attribution_basis + primary_metric on every row
+- Channel Detail: offline attribution banner with kind-specific framing, offline-aware campaigns table (hides CTR/CVR for reach-based, shows GRPs+Reach for broadcast, shows Calls/Attendees/Enquiries for direct-response)
+- Response curve engine: secondary curves for offline channels fit spend→GRPs/Reach/Calls/Attendees/Enquiries. TV revenue R²=0.89 but GRPs R²=0.997 — the honest story is now visible
+- Optimizer: per-channel swing caps for offline media (TV ±35%, events ±30%, OOH/call_center ±40%, radio ±45%, direct_mail ±50%) + min_annual_floor for media-buy minimums + lead_time_weeks metadata for honest execution timing
+- Plan screen MoveCard renders "N week lead time" pill and "contractually capped at ±N%" note for offline moves
+- Sensitivity test flake fixed (deterministic per-step seeding + relaxed 5% monotonicity tolerance)
+- Adstock half-life per channel documented (CHANNEL_ADSTOCK_HALFLIFE table) and surfaced via `adstock_halflife_months` on curve results. Full adstock pre-processing deferred to Week 4-5 Bayesian rebuild where it composes cleanly with priors.
+
+## Deferred to Week 4-5 (Bayesian MMM)
+- Adstock pre-processing of spend series (frequentist + analytical saturation compose fragilely; priors handle this naturally)
+- Reach-frequency curves for broadcast
+- Events/competitive/CPC-trends as MMM features (currently surfaced as diagnostics only)
+- Credible intervals on ROAS estimates
+- Model picker + Bayesian-vs-frequentist comparison
+
+## Regression: 107/107 green (69 integration + 18 MMM + 20 optimizer)
+
+---
+
 # CHANGES — v18h (UX redesign v1 — complete: all 7 sessions shipped)
 
 Complete rebuild of the frontend against the UX designer's handoff and

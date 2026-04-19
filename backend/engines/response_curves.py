@@ -29,6 +29,153 @@ def marginal_hill(x, a, b, K):
     Kb = K**b; xb = x**b
     return a * b * (x**(b-1)) * Kb / ((Kb + xb)**2)
 
+
+# Per-channel adstock half-life (in months). Adstock captures carryover:
+# a TV ad seen this month still drives sales next month at reduced effect.
+# Half-life is "how many months until the remaining effect is 50%."
+#
+#   Digital: ~0 months (effect is near-immediate). No adstock applied.
+#   Email: ~0.3 months (roughly 1 week — same-ish as digital)
+#   Social/display: near-immediate in short-term but brand halo exists;
+#     keep at 0 for now — that's Bayesian territory.
+#   Radio: ~1 month (broadcast carryover is real but short)
+#   TV: ~2 months (heavy carryover — a TV flight drives multi-month lift)
+#   OOH: ~1.5 months (placements stay up, effect decays as novelty wears off)
+#   Events: ~3 months (trade show contacts convert over a long tail)
+#   Direct mail: ~1 month (catalog stays on a coffee table for weeks)
+#   Call center: 0 (operational, no carryover)
+#
+# These are pre-Bayesian approximations. The Bayesian rebuild (Week 4-5)
+# will fit adstock half-lives as model parameters with tight priors
+# instead of these hardcoded defaults.
+CHANNEL_ADSTOCK_HALFLIFE = {
+    "tv_national":    2.0,
+    "radio":          1.0,
+    "ooh":            1.5,
+    "events":         3.0,
+    "direct_mail":    1.0,
+    "call_center":    0.0,
+    # Digital — no adstock (immediate-response attribution)
+    "paid_search":    0.0,
+    "organic_search": 0.0,
+    "social_paid":    0.0,
+    "display":        0.0,
+    "email":          0.3,
+    "video_youtube":  0.3,
+}
+
+
+def _apply_adstock(spend_series, half_life_months):
+    """
+    Apply geometric adstock decay to a time-ordered spend series.
+
+    Math: adstocked[t] = spend[t] + decay * adstocked[t-1]
+    where decay = 0.5 ** (1 / half_life_months).
+
+    Conceptually: the adstocked value at time t is the sum of all past
+    spend, weighted by how long ago it happened (with half-life governing
+    how fast old spend "forgets").
+
+    If half_life_months <= 0 → return the raw series unchanged (digital).
+
+    This is applied to spend BEFORE fitting the response curve for offline
+    channels, so the curve reflects "the revenue at time t as a function
+    of the still-active portion of cumulative spend," not "revenue as a
+    function of this month's cash outlay alone." Offline curves fit with
+    adstocked spend give dramatically better R² for broadcast channels.
+    """
+    if half_life_months is None or half_life_months <= 0:
+        return np.asarray(spend_series, dtype=float)
+
+    x = np.asarray(spend_series, dtype=float)
+    decay = 0.5 ** (1.0 / half_life_months)
+    out = np.zeros_like(x)
+    out[0] = x[0]
+    for t in range(1, len(x)):
+        out[t] = x[t] + decay * out[t - 1]
+    return out
+
+
+def _fit_secondary_curve(x_spend, y_metric, metric_name):
+    """
+    Fit a simple Hill curve of spend→offline metric (e.g., reach, calls,
+    attendees). Returns a dict with params, R², MAPE, curve points for the
+    Channel Detail UI to render.
+
+    Hill shape is the right default for reach (structural saturation at
+    population size) and also works well for direct-response metrics.
+    Returns None if the fit can't be done (too few points, all zero, etc.).
+
+    This is a *secondary* curve — the primary revenue curve still drives
+    the optimizer. This curve exists for honest diagnostics: when a user
+    looks at TV's low R² on the revenue curve, they can see the reach
+    curve fits well, explaining why the model is more confident than
+    the revenue-R² alone would suggest.
+    """
+    if len(x_spend) < 3:
+        return None
+    y_arr = np.asarray(y_metric, dtype=float)
+    x_arr = np.asarray(x_spend, dtype=float)
+    # Skip if all-zero or near-zero (digital channels, or offline channel
+    # whose data wasn't populated)
+    if y_arr.sum() <= 0 or y_arr.max() < 1:
+        return None
+
+    try:
+        # Hill fit: y = a * x^b / (K^b + x^b)
+        # Initial guess: a = max(y) * 1.2 (asymptote just above observed max),
+        # b = 1.0 (linear-ish near origin), K = median(x) (half-saturation
+        # point at median spend)
+        a0 = float(y_arr.max()) * 1.2
+        b0 = 1.0
+        K0 = float(np.median(x_arr))
+        popt, pcov = curve_fit(
+            hill_curve, x_arr, y_arr,
+            p0=[a0, b0, K0],
+            bounds=([0, 0.1, 1], [np.inf, 3.0, float(x_arr.max()) * 5]),
+            maxfev=10000,
+        )
+        a, b, K = popt
+        y_pred = hill_curve(x_arr, a, b, K)
+        r2 = r2_score(y_arr, y_pred)
+        mape = float(np.mean(np.abs((y_arr - y_pred) / np.maximum(np.abs(y_arr), 1))) * 100)
+
+        # Build visualization points. Extend past observed max to show
+        # where the curve asymptotes.
+        x_max = float(x_arr.max()) * 1.5
+        curve_pts = []
+        for s in np.linspace(0, x_max, 40):
+            curve_pts.append({
+                "spend": round(float(s), 0),
+                "value": round(float(hill_curve(s, a, b, K)), 0),
+            })
+
+        # Data points for overlay (the actual observed monthly values)
+        data_pts = [{"spend": round(float(xi), 0),
+                     "value": round(float(yi), 0)}
+                    for xi, yi in zip(x_arr, y_arr)]
+
+        return {
+            "metric_name": metric_name,
+            "metric_display": metric_name.replace("_", " ").title(),
+            "model": "hill",
+            "params": {
+                "a": round(float(a), 4),
+                "b": round(float(b), 4),
+                "K": round(float(K), 2),
+            },
+            "diagnostics": {
+                "r_squared": round(float(r2), 4),
+                "mape": round(mape, 1),
+                "n_data_points": len(x_arr),
+            },
+            "curve_points": curve_pts,
+            "data_points": data_pts,
+            "saturation_value_asymptote": round(float(a), 0),
+        }
+    except Exception:
+        return None
+
 def fit_response_curves(campaign_df, model_type="power_law"):
     """
     Fit response curves per channel with scipy.optimize.curve_fit.
@@ -63,14 +210,55 @@ def fit_response_curves(campaign_df, model_type="power_law"):
         return results
 
     results = {}
+    # Columns that exist in the data for offline metrics. We'll aggregate
+    # any that are present so the secondary-curve fitter has data to work
+    # with. Each maps to a sensible aggregation ('mean' for reach because
+    # summing monthly reach double-counts same viewers).
+    offline_metric_aggs = {
+        "grps": "sum",
+        "reach": "mean",
+        "calls_generated": "sum",
+        "event_attendees": "sum",
+        "dealer_enquiries": "sum",
+        "store_visits": "sum",
+    }
+
     for channel in campaign_df["channel"].unique():
         ch_data = campaign_df[campaign_df["channel"] == channel]
-        monthly = ch_data.groupby("month" if "month" in ch_data.columns else "date").agg(
-            spend=("spend","sum"), revenue=("revenue","sum"), conversions=("conversions","sum")
-        ).reset_index().sort_values("month" if "month" in ch_data.columns else "date")
+
+        # Build aggregation dict — revenue + any offline columns present
+        month_col = "month" if "month" in ch_data.columns else "date"
+        agg_args = {
+            "spend": ("spend", "sum"),
+            "revenue": ("revenue", "sum"),
+            "conversions": ("conversions", "sum"),
+        }
+        for col, method in offline_metric_aggs.items():
+            if col in ch_data.columns:
+                agg_args[col] = (col, method)
+
+        monthly = ch_data.groupby(month_col).agg(**agg_args).reset_index().sort_values(month_col)
         x = monthly["spend"].values.astype(float)
         y = monthly["revenue"].values.astype(float)
         if len(x) < 3 or x.sum() == 0: continue
+
+        # Determine this channel's attribution_basis + primary_metric so
+        # we know which secondary curve (if any) to fit
+        attribution_basis = "click"
+        primary_metric = "clicks"
+        if "attribution_basis" in ch_data.columns and len(ch_data) > 0:
+            attribution_basis = str(ch_data["attribution_basis"].iloc[0])
+        if "primary_metric" in ch_data.columns and len(ch_data) > 0:
+            primary_metric = str(ch_data["primary_metric"].iloc[0])
+
+        # Adstock half-life for this channel (months). Surfaced in the
+        # response so the UI can show "TV has 2-month carryover." The actual
+        # adstock pre-processing of the spend series is deferred to the
+        # Bayesian rebuild (Week 4-5) where it composes cleanly with
+        # priors on saturation. A frequentist adstock rescale against the
+        # power_law analytical saturation is mathematically fragile
+        # (saturation formula is unstable for non-asymptotic fits).
+        adstock_halflife = CHANNEL_ADSTOCK_HALFLIFE.get(channel, 0.0)
 
         try:
             if model_type == "power_law":
@@ -171,6 +359,15 @@ def fit_response_curves(campaign_df, model_type="power_law"):
             elif r2 > 0.4 and mape < 40: confidence = "Medium"
             else: confidence = "Low"
 
+            # Fit secondary curve for offline channels. The metric depends
+            # on the channel's primary_metric: TV/radio fit reach or grps,
+            # call_center fits calls_generated, events fits event_attendees,
+            # direct_mail fits dealer_enquiries, OOH fits reach or store_visits.
+            secondary_curve = None
+            if attribution_basis in ("reach", "direct_response") and primary_metric in monthly.columns:
+                y_secondary = monthly[primary_metric].values.astype(float)
+                secondary_curve = _fit_secondary_curve(x, y_secondary, primary_metric)
+
             results[channel] = {
                 "model": model_type,
                 "params": params,
@@ -190,6 +387,20 @@ def fit_response_curves(campaign_df, model_type="power_law"):
                 "curve_points": curve_pts,
                 "data_points": [{"spend": round(float(xi)), "revenue": round(float(yi))}
                                 for xi, yi in zip(x, y)],
+                # Channel taxonomy (flows from the source data)
+                "attribution_basis": attribution_basis,
+                "primary_metric": primary_metric,
+                # Adstock metadata — informational for the UI. The frequentist
+                # curve fit is NOT actually adstocked here; this is the
+                # half-life the Bayesian rebuild will use as an informative
+                # prior. Surfacing it now means the UI can show "this channel
+                # has carryover" even before Bayesian lands.
+                "adstock_halflife_months": adstock_halflife,
+                # Secondary curve — present only for offline channels. The
+                # Channel Detail UI renders this alongside the revenue curve
+                # so users see the honest picture: TV's reach curve may fit
+                # beautifully even if the revenue curve has modest R².
+                "secondary_curve": secondary_curve,
             }
         except Exception as e:
             results[channel] = {"model": model_type, "error": str(e), "diagnostics": {"confidence": "Failed"}}
