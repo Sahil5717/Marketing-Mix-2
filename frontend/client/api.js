@@ -318,6 +318,30 @@ export async function ensureMarketContextReady() {
   return { data: null, error };
 }
 
+// ─── Market adjustments (Week 7) ───
+
+/**
+ * Fetch the current market adjustments overlay for the Plan screen.
+ * Returns { data: {adjustments, baseline_total_revenue_delta,
+ * adjusted_total_revenue_delta, summary}, error }.
+ *
+ * `summary.has_market_data` is false when no external data was uploaded.
+ * UI should hide the section in that case.
+ */
+export async function fetchMarketAdjustments() {
+  return apiRequest("/market-adjustments");
+}
+
+/**
+ * Toggle a single adjustment on/off. Editor-only.
+ */
+export async function overrideMarketAdjustment(adjustmentId, applied) {
+  return apiRequest("/market-adjustments/override", {
+    method: "POST",
+    body: JSON.stringify({ adjustment_id: adjustmentId, applied }),
+  });
+}
+
 // ─── Bayesian MMM ───
 
 /**

@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import styled from "styled-components";
 import { t } from "../tokens.js";
+import { fetchMarketAdjustments, overrideMarketAdjustment } from "../api.js";
 import {
   HeroRow,
   HeroLeft,
@@ -47,6 +48,39 @@ export function Plan({
   // editing is queued for a future iteration.
 }) {
   const [activeTab, setActiveTab] = useState("moves");
+  // Market adjustments overlay — fetched separately so Plan doesn't block
+  // on it. null = loading, object = loaded (may have has_market_data:false).
+  const [marketAdj, setMarketAdj] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMarketAdjustments().then(({ data }) => {
+      if (!cancelled && data) setMarketAdj(data);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Handler for analyst override toggle (editor mode only)
+  const handleAdjustmentToggle = async (adjustmentId, newApplied) => {
+    // Optimistic update first so the UI feels snappy
+    setMarketAdj((prev) => {
+      if (!prev) return prev;
+      const adjustments = prev.adjustments.map((a) =>
+        a.id === adjustmentId ? { ...a, applied: newApplied } : a
+      );
+      const net_delta = adjustments
+        .filter((a) => a.applied)
+        .reduce((s, a) => s + (a.revenue_delta || 0), 0);
+      return {
+        ...prev,
+        adjustments,
+        adjusted_total_revenue_delta: prev.baseline_total_revenue_delta + net_delta,
+        summary: { ...prev.summary, net_delta },
+      };
+    });
+    // Fire-and-forget server sync; re-fetch on error if ever hit one
+    await overrideMarketAdjustment(adjustmentId, newApplied);
+  };
 
   if (!data) return null;
 
@@ -142,6 +176,15 @@ export function Plan({
         </HeroRight>
       </HeroRow>
 
+      {/* ── Market overlay — sits above SubNav when external data present ── */}
+      {marketAdj && marketAdj.summary?.has_market_data && marketAdj.adjustments?.length > 0 && (
+        <MarketOverlay
+          data={marketAdj}
+          editorMode={editorMode}
+          onToggle={handleAdjustmentToggle}
+        />
+      )}
+
       {/* ── SubNav ── */}
       <SubNav>
         <SubNavTab
@@ -218,6 +261,195 @@ export function Plan({
 }
 
 // ─── Sub-components ───
+
+/**
+ * MarketOverlay — the "Market adjustments applied" section.
+ *
+ * Visible between the Plan hero and SubNav when external market data
+ * (events / trends / competitive) has been processed. Shows:
+ *   - Honest attribution header: "Plan uses Bayesian MMM for baseline
+ *     ROAS + market overlay for current conditions"
+ *   - Summary: baseline delta → adjusted delta, with net market impact
+ *   - List of adjustment cards, grouped by source (events / trends /
+ *     competitive), each with source badge, magnitude, rationale, and
+ *     an override toggle (editor mode only)
+ *
+ * Design choice: NOT collapsed by default. The Partner specifically asked
+ * for market changes to be visible on Plan, so hiding them behind a
+ * disclosure would miss the point.
+ */
+function MarketOverlay({ data, editorMode, onToggle }) {
+  const { adjustments = [], summary = {}, baseline_total_revenue_delta = 0, adjusted_total_revenue_delta = 0 } = data;
+  const [expanded, setExpanded] = useState(true);
+
+  // Group adjustments by source for visual sectioning
+  const grouped = useMemo(() => {
+    const g = { events: [], cost_trends: [], competitive: [] };
+    for (const a of adjustments) {
+      if (g[a.source]) g[a.source].push(a);
+    }
+    return g;
+  }, [adjustments]);
+
+  const netDelta = summary.net_delta || 0;
+  const hasActiveAdjustments = adjustments.some((a) => a.applied);
+  const appliedCount = adjustments.filter((a) => a.applied).length;
+
+  return (
+    <OverlayWrap>
+      <OverlayHead>
+        <OverlayEyebrow>
+          <EyebrowDot />
+          PLAN · MARKET OVERLAY
+        </OverlayEyebrow>
+        <OverlayHeadlineRow>
+          <OverlayHeadline>
+            Plan uses Bayesian MMM for baseline ROAS + market overlay for current conditions
+          </OverlayHeadline>
+          <OverlayToggleBtn
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+          >
+            {expanded ? "Collapse" : "Expand"}
+            <ChevronSpan $expanded={expanded}>▾</ChevronSpan>
+          </OverlayToggleBtn>
+        </OverlayHeadlineRow>
+        <OverlaySub>
+          {hasActiveAdjustments ? (
+            <>
+              <strong>{appliedCount}</strong> of <strong>{adjustments.length}</strong> market
+              adjustment{adjustments.length === 1 ? "" : "s"} applied to the plan.{" "}
+              {Math.abs(netDelta) >= 1e4 && (
+                <>Net revenue impact: <DeltaInline $positive={netDelta >= 0}>
+                  {formatSignedMoney(netDelta)}
+                </DeltaInline> vs. baseline.</>
+              )}
+            </>
+          ) : (
+            <>All {adjustments.length} market adjustment{adjustments.length === 1 ? "" : "s"} disabled. Plan reflects baseline only.</>
+          )}
+        </OverlaySub>
+      </OverlayHead>
+
+      {expanded && (
+        <OverlayBody>
+          <OverlaySummaryRow>
+            <OverlaySummaryCard>
+              <OverlaySummaryLabel>Baseline plan impact</OverlaySummaryLabel>
+              <OverlaySummaryValue>
+                {formatSignedMoney(baseline_total_revenue_delta)}
+              </OverlaySummaryValue>
+              <OverlaySummarySub>from optimizer + Bayesian MMM</OverlaySummarySub>
+            </OverlaySummaryCard>
+
+            <OverlaySummaryArrow>→</OverlaySummaryArrow>
+
+            <OverlaySummaryCard $accent>
+              <OverlaySummaryLabel>Market-adjusted impact</OverlaySummaryLabel>
+              <OverlaySummaryValue>
+                {formatSignedMoney(adjusted_total_revenue_delta)}
+              </OverlaySummaryValue>
+              <OverlaySummarySub>
+                {netDelta >= 0 ? "Market tailwind" : "Market headwind"}:{" "}
+                <DeltaInline $positive={netDelta >= 0}>
+                  {formatSignedMoney(netDelta)}
+                </DeltaInline>
+              </OverlaySummarySub>
+            </OverlaySummaryCard>
+          </OverlaySummaryRow>
+
+          {Object.entries(grouped).map(([source, items]) =>
+            items.length > 0 ? (
+              <AdjustmentGroup key={source}>
+                <AdjustmentGroupHead>
+                  <AdjustmentSourceBadge $source={source}>
+                    {sourceLabel(source)}
+                  </AdjustmentSourceBadge>
+                  <AdjustmentGroupCount>
+                    {items.length} signal{items.length === 1 ? "" : "s"}
+                  </AdjustmentGroupCount>
+                </AdjustmentGroupHead>
+                <AdjustmentGrid>
+                  {items.map((adj) => (
+                    <AdjustmentCard
+                      key={adj.id}
+                      adjustment={adj}
+                      editorMode={editorMode}
+                      onToggle={onToggle}
+                    />
+                  ))}
+                </AdjustmentGrid>
+              </AdjustmentGroup>
+            ) : null
+          )}
+        </OverlayBody>
+      )}
+    </OverlayWrap>
+  );
+}
+
+/**
+ * Single adjustment card — source chip, headline, rationale, formula,
+ * override toggle (editor mode only).
+ */
+function AdjustmentCard({ adjustment, editorMode, onToggle }) {
+  const applied = adjustment.applied !== false;
+  const positive = (adjustment.revenue_delta || 0) >= 0;
+  return (
+    <AdjCardWrap $applied={applied}>
+      <AdjCardHead>
+        <AdjCardHeadline>{adjustment.headline}</AdjCardHeadline>
+        {editorMode && (
+          <AdjToggleLabel>
+            <AdjToggleInput
+              type="checkbox"
+              checked={applied}
+              onChange={(e) => onToggle(adjustment.id, e.target.checked)}
+            />
+            <AdjToggleTrack $checked={applied}>
+              <AdjToggleKnob $checked={applied} />
+            </AdjToggleTrack>
+            <AdjToggleText>{applied ? "Applied" : "Disabled"}</AdjToggleText>
+          </AdjToggleLabel>
+        )}
+      </AdjCardHead>
+
+      <AdjCardRationale>{adjustment.rationale}</AdjCardRationale>
+
+      <AdjCardFooter>
+        <AdjCardStat>
+          <AdjCardStatLabel>Revenue impact</AdjCardStatLabel>
+          <AdjCardStatValue $positive={positive}>
+            {formatSignedMoney(adjustment.revenue_delta || 0)}
+          </AdjCardStatValue>
+        </AdjCardStat>
+        <AdjCardFormula title={adjustment.formula}>
+          <AdjCardFormulaLabel>Formula</AdjCardFormulaLabel>
+          <AdjCardFormulaValue>{adjustment.formula}</AdjCardFormulaValue>
+        </AdjCardFormula>
+        <AdjCardSource title={adjustment.source_ref}>
+          {adjustment.source_ref}
+        </AdjCardSource>
+      </AdjCardFooter>
+    </AdjCardWrap>
+  );
+}
+
+function sourceLabel(source) {
+  if (source === "events") return "Events calendar";
+  if (source === "cost_trends") return "Cost trends";
+  if (source === "competitive") return "Competitive SOV";
+  return source;
+}
+
+function formatSignedMoney(n) {
+  if (n == null || n === 0) return "$0";
+  const sign = n < 0 ? "-" : "+";
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(0)}K`;
+  return `${sign}$${Math.round(abs)}`;
+}
 
 function MoveGroup({ title, moves, totalLabel, direction }) {
   return (
@@ -1407,4 +1639,361 @@ const CompareFooterCopy = styled.p`
   color: ${t.color.ink2};
   line-height: ${t.leading.relaxed};
   margin: 0;
+`;
+
+// ─── Market overlay styled components ───
+
+const OverlayWrap = styled.section`
+  margin: ${t.space[6]} 0 ${t.space[8]};
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.md};
+  box-shadow: ${t.shadow.card};
+  overflow: hidden;
+`;
+
+const OverlayHead = styled.div`
+  padding: ${t.space[5]} ${t.space[6]};
+  border-bottom: 1px solid ${t.color.borderFaint};
+  background: linear-gradient(
+    to bottom,
+    ${t.color.sunken},
+    ${t.color.surface}
+  );
+`;
+
+const OverlayEyebrow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.accent};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const EyebrowDot = styled.span`
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: ${t.color.accent};
+`;
+
+const OverlayHeadlineRow = styled.div`
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: ${t.space[4]};
+  margin-bottom: ${t.space[2]};
+`;
+
+const OverlayHeadline = styled.h2`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.xl};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink};
+  line-height: ${t.leading.tight};
+  margin: 0;
+  flex: 1;
+`;
+
+const OverlayToggleBtn = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  padding: ${t.space[2]} ${t.space[3]};
+  border: 1px solid ${t.color.border};
+  background: ${t.color.surface};
+  border-radius: ${t.radius.sm};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink2};
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  transition: background ${t.motion.base} ${t.motion.ease};
+  flex-shrink: 0;
+
+  &:hover { background: ${t.color.sunken}; }
+`;
+
+const ChevronSpan = styled.span`
+  display: inline-block;
+  transform: ${({ $expanded }) => ($expanded ? "rotate(0deg)" : "rotate(-90deg)")};
+  transition: transform ${t.motion.base} ${t.motion.ease};
+`;
+
+const OverlaySub = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink3};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+
+  strong {
+    color: ${t.color.ink2};
+    font-variant-numeric: tabular-nums;
+  }
+`;
+
+const DeltaInline = styled.span`
+  color: ${({ $positive }) => ($positive ? t.color.positive : t.color.negative)};
+  font-weight: ${t.weight.semibold};
+  font-variant-numeric: tabular-nums;
+`;
+
+const OverlayBody = styled.div`
+  padding: ${t.space[6]};
+`;
+
+const OverlaySummaryRow = styled.div`
+  display: flex;
+  align-items: stretch;
+  gap: ${t.space[4]};
+  margin-bottom: ${t.space[6]};
+
+  @media (max-width: 720px) {
+    flex-direction: column;
+  }
+`;
+
+const OverlaySummaryCard = styled.div`
+  flex: 1;
+  padding: ${t.space[4]} ${t.space[5]};
+  background: ${({ $accent }) => ($accent ? t.color.accentSub : t.color.sunken)};
+  border: 1px solid ${({ $accent }) => ($accent ? t.color.accent : t.color.borderFaint)};
+  border-radius: ${t.radius.sm};
+`;
+
+const OverlaySummaryArrow = styled.div`
+  display: flex;
+  align-items: center;
+  font-size: ${t.size.xl};
+  color: ${t.color.ink3};
+
+  @media (max-width: 720px) {
+    justify-content: center;
+    transform: rotate(90deg);
+  }
+`;
+
+const OverlaySummaryLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const OverlaySummaryValue = styled.div`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.xl};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink};
+  font-variant-numeric: tabular-nums;
+  margin-bottom: ${t.space[1]};
+`;
+
+const OverlaySummarySub = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+`;
+
+const AdjustmentGroup = styled.div`
+  margin-bottom: ${t.space[6]};
+
+  &:last-child { margin-bottom: 0; }
+`;
+
+const AdjustmentGroupHead = styled.div`
+  display: flex;
+  align-items: center;
+  gap: ${t.space[3]};
+  margin-bottom: ${t.space[4]};
+  padding-bottom: ${t.space[2]};
+  border-bottom: 1px solid ${t.color.borderFaint};
+`;
+
+const AdjustmentSourceBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  padding: 3px ${t.space[3]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  border-radius: ${t.radius.sm};
+  ${({ $source }) => {
+    if ($source === "events") {
+      return `background: ${t.color.accentSub}; color: ${t.color.accentInk};`;
+    }
+    if ($source === "cost_trends") {
+      return `background: ${t.color.sunken}; color: ${t.color.ink2};`;
+    }
+    if ($source === "competitive") {
+      return `background: ${t.color.positiveBg}; color: ${t.color.positive};`;
+    }
+    return `background: ${t.color.sunken}; color: ${t.color.ink3};`;
+  }}
+`;
+
+const AdjustmentGroupCount = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  font-variant-numeric: tabular-nums;
+`;
+
+const AdjustmentGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: ${t.space[4]};
+`;
+
+const AdjCardWrap = styled.div`
+  padding: ${t.space[4]};
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-radius: ${t.radius.sm};
+  opacity: ${({ $applied }) => ($applied ? 1 : 0.55)};
+  transition: opacity ${t.motion.base} ${t.motion.ease};
+`;
+
+const AdjCardHead = styled.div`
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: ${t.space[3]};
+  margin-bottom: ${t.space[2]};
+`;
+
+const AdjCardHeadline = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink};
+  line-height: ${t.leading.tight};
+  flex: 1;
+`;
+
+const AdjToggleLabel = styled.label`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  cursor: pointer;
+  flex-shrink: 0;
+`;
+
+const AdjToggleInput = styled.input`
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+`;
+
+const AdjToggleTrack = styled.span`
+  position: relative;
+  width: 32px;
+  height: 18px;
+  border-radius: 9px;
+  background: ${({ $checked }) => ($checked ? t.color.accent : t.color.borderFaint)};
+  transition: background ${t.motion.base} ${t.motion.ease};
+`;
+
+const AdjToggleKnob = styled.span`
+  position: absolute;
+  top: 2px;
+  left: ${({ $checked }) => ($checked ? "16px" : "2px")};
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: ${t.color.surface};
+  transition: left ${t.motion.base} ${t.motion.ease};
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+`;
+
+const AdjToggleText = styled.span`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink3};
+  min-width: 50px;
+`;
+
+const AdjCardRationale = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0 0 ${t.space[4]};
+`;
+
+const AdjCardFooter = styled.div`
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  gap: ${t.space[2]} ${t.space[4]};
+  padding-top: ${t.space[3]};
+  border-top: 1px dashed ${t.color.borderFaint};
+`;
+
+const AdjCardStat = styled.div`
+  grid-row: 1;
+  grid-column: 1;
+`;
+
+const AdjCardStatLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: 2px;
+`;
+
+const AdjCardStatValue = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.md};
+  font-weight: ${t.weight.semibold};
+  color: ${({ $positive }) => ($positive ? t.color.positive : t.color.negative)};
+  font-variant-numeric: tabular-nums;
+`;
+
+const AdjCardFormula = styled.div`
+  grid-row: 1;
+  grid-column: 2;
+  text-align: right;
+`;
+
+const AdjCardFormulaLabel = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: 2px;
+`;
+
+const AdjCardFormulaValue = styled.div`
+  font-family: ${t.font.mono};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink2};
+  font-variant-numeric: tabular-nums;
+`;
+
+const AdjCardSource = styled.div`
+  grid-row: 2;
+  grid-column: 1 / -1;
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink4};
+  font-style: italic;
 `;

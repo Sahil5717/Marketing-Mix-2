@@ -1,3 +1,89 @@
+# CHANGES — v23 (MarketLens — Market overlay on Plan + Diagnosis snippet, Week 7 of 9-week plan)
+
+Week 7 of the extended 9-week pitch prep. Addresses the Partner's
+direct feedback: "plan should include market changes, suggestions
+should consider past data AND current situation."
+
+## What changed vs v22
+
+### Scope framing
+The Partner's ask was interpreted as an OUTCOME ("plan reflects market
+conditions") rather than a methodology claim ("events as Bayesian
+covariates"). We shipped **Option B — explicit market adjustments
+layer** with honest attribution, not structural covariate integration
+in PyMC. The Option B approach is defensible in Q&A, traceable per
+adjustment, and under the analyst's control. Option A (structural
+covariate integration) remains optionally queued for Week 9 if time
+permits.
+
+### New backend engine
+- `engines/market_adjustments.py` — transforms external data (events /
+  cost trends / competitive) into structured overlays on plan moves
+- Each adjustment has: source, kind, headline, magnitude_pct,
+  revenue_delta, affected_channels, affected_months, rationale,
+  formula, source_ref, applied flag
+- Three adjustment types:
+  - **Events → baseline uplift**: `pct × (annualized baseline / 12)`
+  - **Cost trends → ROAS adjustment**: `base_delta × -yoy_pct%` (>5% noise threshold)
+  - **Competitive SOV → reach dampening**: `base_delta × (sov - 0.4) × 100` (reach channels only)
+- Honest filtering: past events skipped, sub-5% trends skipped,
+  non-reach channels skip competitive dampening
+- `generate_diagnosis_market_snippet()` — interpretive
+  cross-referencing: finds signal, finds related finding by channel,
+  generates implication prose ("Makes 'Paid Search is underinvested'
+  more urgent — execution window closes in 44 days")
+
+### Mock market data generation
+- `mock_data.py` extended with `generate_market_events()`,
+  `generate_market_trends()`, `generate_competitive_data()`
+- `/api/load-mock-data` wires mock dataframes through the existing
+  `process_market_events / process_market_trends /
+  process_competitive_data` pipelines — same code path as CSV uploads
+- Demo data includes: Diwali +22%, Black Friday +18%, Competitor IPL
+  -8%, past Independence Day for context, Paid Search CPC +22% YoY,
+  Display CPM -13% YoY, low TV/OOH SOV
+
+### New API endpoints
+- `GET /api/market-adjustments` — current overlay, applies in-memory overrides
+- `POST /api/market-adjustments/override` — toggle single adjustment
+
+### Frontend — Plan overlay
+- New `MarketOverlay` component positioned between Hero and SubNav on Plan
+- Collapsible, default expanded (Partner's ask: visibility matters)
+- Honest attribution header: "Plan uses Bayesian MMM for baseline ROAS
+  + market overlay for current conditions"
+- Baseline → adjusted summary cards with arrow connector
+- Adjustments grouped by source (Events / Cost trends / Competitive)
+  with source-colored badges
+- `AdjustmentCard` — toggle switch (editor only), headline, rationale,
+  revenue impact stat, formula, source_ref
+- Optimistic updates on toggle with server sync
+
+### Frontend — Diagnosis snippet
+- New `MarketSnippetCard` at top of Findings tab
+- Urgency-sorted (high/medium/low)
+- Per-signal kind badge (Event / Cost / SOV), signal, implication,
+  urgency pill, "↔ Linked to a finding below" callout when a finding
+  cross-reference exists
+
+### Regression
+- 30 new unit tests for `market_adjustments` engine — events, trends,
+  competitive, overrides, noise filtering, channel-archetype rules
+- 107/107 core regression still green: 69 integration + 18 MMM + 20 optimizer
+- Total: 137/137 on fast suites + 44/44 Bayesian fast
+
+### Deferred
+- Scenarios screen market overlay integration — per-scenario overlay
+  computation requires separate session, not Partner-requested
+- Option A (structural covariate integration in PyMC) — queued for
+  Week 9 as optional time-boxed attempt
+
+### Bundle impact
+- AppHeader + Plan + Diagnosis: 119KB, 25KB gzipped (+15KB over v22 for
+  overlay + snippet UI)
+
+---
+
 # CHANGES — v22 (MarketLens — Week 5-6 polish, pitch-ready)
 
 Closing out the 6-week pitch prep with Bayesian Compare pane + login

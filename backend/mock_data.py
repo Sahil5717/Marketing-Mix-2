@@ -701,6 +701,170 @@ def _adjust_weights_for_stage(weights, channels, stage):
     return adjusted
 
 
+def generate_market_events() -> pd.DataFrame:
+    """
+    Generate a realistic forward-looking events calendar.
+
+    For a pitch demo, we want a mix:
+      - 1-2 big positive upcoming events (holiday, product launch)
+      - 1 negative risk event (competitor action)
+      - 1-2 recent-past events for context
+
+    Dates are relative to today so the demo always looks current.
+    """
+    today = pd.Timestamp.now().normalize()
+    rows = [
+        # Big upcoming positive — next ~30-60 days
+        {
+            "event_date": (today + pd.Timedelta(days=45)).date(),
+            "event_end_date": (today + pd.Timedelta(days=47)).date(),
+            "event_type": "holiday", "event_name": "Diwali 2026",
+            "impact_direction": "positive", "impact_magnitude": "high",
+            "impact_pct": 22.0,
+            "affected_channels": "paid_search;social_paid;tv_national",
+            "confidence": "high",
+        },
+        # Medium upcoming
+        {
+            "event_date": (today + pd.Timedelta(days=75)).date(),
+            "event_end_date": (today + pd.Timedelta(days=76)).date(),
+            "event_type": "campaign", "event_name": "Black Friday 2026",
+            "impact_direction": "positive", "impact_magnitude": "high",
+            "impact_pct": 18.0,
+            "affected_channels": "paid_search;social_paid;email",
+            "confidence": "high",
+        },
+        # Negative upcoming risk
+        {
+            "event_date": (today + pd.Timedelta(days=20)).date(),
+            "event_end_date": (today + pd.Timedelta(days=30)).date(),
+            "event_type": "competitor", "event_name": "Competitor IPL Sponsorship",
+            "impact_direction": "negative", "impact_magnitude": "medium",
+            "impact_pct": -8.0,
+            "affected_channels": "tv_national;ooh",
+            "confidence": "estimated",
+        },
+        # Recent past (context, not acted on)
+        {
+            "event_date": (today - pd.Timedelta(days=20)).date(),
+            "event_end_date": (today - pd.Timedelta(days=18)).date(),
+            "event_type": "holiday", "event_name": "Independence Day 2026",
+            "impact_direction": "positive", "impact_magnitude": "medium",
+            "impact_pct": 12.0,
+            "affected_channels": "tv_national;paid_search",
+            "confidence": "high",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def generate_market_trends() -> pd.DataFrame:
+    """
+    Generate realistic CPC/CPM trend data for key channels over the
+    past 12 months. Shows rising costs on search (competitive pressure),
+    stable social, declining display.
+    """
+    today = pd.Timestamp.now().normalize()
+    rows = []
+
+    # Paid search CPC — rising steadily
+    base_cpc_ps = 1.85
+    for i in range(12, -1, -1):
+        d = today - pd.Timedelta(days=30 * i)
+        inflation = 1.0 + (12 - i) * 0.018  # ~22% over 12 months
+        rows.append({
+            "metric_type": "cpc_trend", "channel": "paid_search",
+            "date": d.date(), "value": round(base_cpc_ps * inflation, 2),
+            "yoy_change_pct": 22.0,
+        })
+
+    # Social paid CPC — modest rise
+    base_cpc_sp = 0.85
+    for i in range(12, -1, -1):
+        d = today - pd.Timedelta(days=30 * i)
+        inflation = 1.0 + (12 - i) * 0.006  # ~8% over 12 months
+        rows.append({
+            "metric_type": "cpc_trend", "channel": "social_paid",
+            "date": d.date(), "value": round(base_cpc_sp * inflation, 2),
+            "yoy_change_pct": 8.0,
+        })
+
+    # Display CPM — declining (oversupply)
+    base_cpm_d = 4.20
+    for i in range(12, -1, -1):
+        d = today - pd.Timedelta(days=30 * i)
+        deflation = 1.0 - (12 - i) * 0.011  # ~-13% over 12 months
+        rows.append({
+            "metric_type": "cpm_trend", "channel": "display",
+            "date": d.date(), "value": round(base_cpm_d * deflation, 2),
+            "yoy_change_pct": -13.0,
+        })
+
+    # Video YouTube CPM — flat
+    base_cpm_yt = 9.50
+    for i in range(12, -1, -1):
+        d = today - pd.Timedelta(days=30 * i)
+        rows.append({
+            "metric_type": "cpm_trend", "channel": "video_youtube",
+            "date": d.date(), "value": round(base_cpm_yt * (1.0 + (12-i)*0.002), 2),
+            "yoy_change_pct": 2.5,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def generate_competitive_data(campaign_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate competitive intelligence data — estimated competitor spend
+    per channel per quarter. Creates a scenario where:
+      - We have LOW SOV on tv_national (dominant competitor)
+      - We have LOW SOV on ooh (also losing ground)
+      - We have STRONG SOV on paid_search and events (winning)
+      - Neutral elsewhere
+    """
+    today = pd.Timestamp.now().normalize()
+    our_spend = campaign_df.groupby("channel")["spend"].sum().to_dict()
+
+    # Competitor spend multipliers — higher = we're losing SOV
+    competitor_mult = {
+        "tv_national": 3.5,   # they spend 3.5x what we do → our SOV ~22%
+        "ooh": 2.8,            # → our SOV ~26%
+        "paid_search": 0.5,    # we dominate → SOV ~67%
+        "events": 0.4,         # we dominate → SOV ~71%
+        "social_paid": 1.2,    # slightly behind → SOV ~45%
+        "tv_regional": 1.5,
+        "direct_mail": 1.0,
+        "radio": 1.8,
+        "display": 1.1,
+        "video_youtube": 1.3,
+        "email": 0.3,
+        "call_center": 0.6,
+        "organic_search": 0.8,
+    }
+
+    rows = []
+    # Two time points for growth calculation
+    for days_back in [365, 0]:
+        date = today - pd.Timedelta(days=days_back)
+        for channel, spend in our_spend.items():
+            mult = competitor_mult.get(channel, 1.0)
+            # Competitor growth pattern: TV and OOH competitors growing fast
+            growth = 1.0
+            if days_back == 0 and channel in ("tv_national", "ooh"):
+                growth = 1.15  # 15% growth
+            elif days_back == 0:
+                growth = 1.05  # 5% baseline market growth
+            competitor_spend = spend * mult * growth
+            rows.append({
+                "date": date.date(),
+                "channel": channel,
+                "estimated_spend": round(competitor_spend, 0),
+                "source": "SimilarWeb estimate",
+            })
+
+    return pd.DataFrame(rows)
+
+
 def generate_all_data() -> Dict[str, pd.DataFrame]:
     """Generate all mock datasets and return as dict of DataFrames."""
     print("Generating campaign performance data...")
@@ -708,6 +872,15 @@ def generate_all_data() -> Dict[str, pd.DataFrame]:
     
     print("Generating user journey data...")
     journey_df = generate_user_journeys(campaign_df)
+
+    print("Generating market events...")
+    events_df = generate_market_events()
+
+    print("Generating market trends...")
+    trends_df = generate_market_trends()
+
+    print("Generating competitive data...")
+    competitive_df = generate_competitive_data(campaign_df)
     
     print(f"Campaign data: {len(campaign_df)} rows")
     print(f"Journey data: {len(journey_df)} rows")
@@ -717,10 +890,14 @@ def generate_all_data() -> Dict[str, pd.DataFrame]:
     print(f"Total spend: ${campaign_df['spend'].sum():,.0f}")
     print(f"Total revenue: ${campaign_df['revenue'].sum():,.0f}")
     print(f"Overall ROI: {(campaign_df['revenue'].sum() - campaign_df['spend'].sum()) / campaign_df['spend'].sum():.2f}x")
+    print(f"Events: {len(events_df)} · Trends: {len(trends_df)} · Competitive: {len(competitive_df)} rows")
     
     return {
         "campaign_performance": campaign_df,
         "user_journeys": journey_df,
+        "market_events": events_df,
+        "market_trends": trends_df,
+        "competitive_data": competitive_df,
     }
 
 

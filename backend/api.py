@@ -4,7 +4,7 @@ All imports updated to match upgraded engine function names.
 Run: uvicorn api:app --reload --port 8000
 """
 import os, sys, json, tempfile
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -195,7 +195,32 @@ def load_mock_data():
     _state["campaign_data"] = data["campaign_performance"]
     _state["journey_data"] = data["user_journeys"]
     _state["validation"] = validate_data(_state["campaign_data"])
-    
+
+    # Process mock market data through the existing external_data pipeline
+    # so the demo flow shows adjustments without requiring CSV uploads.
+    # Same processors handle both — mock just provides the dataframes.
+    reporting_df = _state["campaign_data"]
+    try:
+        if "market_events" in data:
+            _state["events_result"] = process_market_events(
+                data["market_events"], reporting_df
+            )
+        if "market_trends" in data:
+            _state["trends_result"] = process_market_trends(
+                data["market_trends"], reporting_df
+            )
+        if "competitive_data" in data:
+            _state["competitive_result"] = process_competitive_data(
+                data["competitive_data"], reporting_df
+            )
+    except Exception as e:
+        # Market data failures are non-fatal — the rest of the app works
+        # without them. Log and continue.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Mock market data processing failed: %s — continuing without.", e
+        )
+
     # Auto-run all engines so subsequent calls work
     _run_all_engines()
     
@@ -208,6 +233,11 @@ def load_mock_data():
         "total_spend": float(_state["campaign_data"]["spend"].sum()),
         "total_revenue": float(_state["campaign_data"]["revenue"].sum()),
         "engines_run": True,
+        "market_data_loaded": all([
+            _state.get("events_result"),
+            _state.get("trends_result"),
+            _state.get("competitive_result"),
+        ]),
     })
 
 
@@ -1811,6 +1841,25 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
         view=view,
     )
 
+    # Market snippet — interpretive cross-reference of market signals
+    # against the findings. Only attached when external data is available;
+    # UI hides the section when this is null.
+    try:
+        from engines.market_adjustments import generate_diagnosis_market_snippet
+        market_snippet = generate_diagnosis_market_snippet(
+            findings=result.get("findings") or [],
+            events_result=_state.get("events_result"),
+            trends_result=_state.get("trends_result"),
+            competitive_result=_state.get("competitive_result"),
+        )
+        if market_snippet:
+            result["market_snippet"] = market_snippet
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Failed to generate diagnosis market snippet: %s — continuing without.", e
+        )
+
     # Enrich KPIs with QoQ deltas so the UI can show "▲ 0.4 vs last
     # quarter" under the Portfolio ROAS number (and equivalent for
     # the other KPI cards). The QoQ data was already computed during
@@ -2129,6 +2178,84 @@ def get_plan(view: str = "client", engagement_id: str = "default",
         bayes_result=_state.get("bayes_result"),
     )
     return _j(plan)
+
+
+# ═══ Market adjustments (Week 7) ═══
+#
+# Engine lives in engines/market_adjustments.py. This endpoint consumes
+# the current plan + external data results and returns the structured
+# overlay. Frontend Plan/Scenarios/Diagnosis screens call this to render
+# the "Market adjustments applied" section + Diagnosis snippet.
+#
+# Overrides are in-memory per session (no DB table for Week 7 — defer if
+# the pitch shows it's actually used). Keyed by adjustment_id.
+
+@app.get("/api/market-adjustments")
+def get_market_adjustments(engagement_id: str = "default"):
+    """
+    Return the current market adjustments overlay.
+
+    Structure: see engines/market_adjustments.generate_market_adjustments.
+    If no external data uploaded, returns an empty list with
+    summary.has_market_data=False — UI should hide the section.
+    """
+    from engines.market_adjustments import generate_market_adjustments, apply_overrides
+
+    # Get the current plan moves — reuse the same logic as get_plan() but
+    # don't go through the endpoint (would be redundant). Pull optimization
+    # from _state.
+    optimization = _state.get("optimization")
+    if not optimization:
+        return _j({
+            "adjustments": [],
+            "baseline_total_revenue_delta": 0,
+            "adjusted_total_revenue_delta": 0,
+            "summary": {
+                "adjustment_count": 0, "net_delta": 0,
+                "has_market_data": False,
+                "message": "Run analysis first.",
+            },
+        })
+
+    # Build moves inline — same call shape as generate_plan uses
+    from engines.narrative_plan import build_moves
+    moves = build_moves(
+        optimization.get("channels", []),
+        curves=_state.get("curves") or {},
+        bayes_result=_state.get("bayes_result"),
+    )
+
+    payload = generate_market_adjustments(
+        plan_moves=moves,
+        events_result=_state.get("events_result"),
+        trends_result=_state.get("trends_result"),
+        competitive_result=_state.get("competitive_result"),
+    )
+
+    # Apply in-memory overrides if any
+    overrides = _state.get("market_adjustment_overrides", {}) or {}
+    if overrides:
+        payload = apply_overrides(payload, overrides)
+
+    return _j(payload)
+
+
+@app.post("/api/market-adjustments/override")
+def override_market_adjustment(payload: Dict[str, Any] = Body(...)):
+    """
+    Toggle an adjustment on/off. Body: {"adjustment_id": "...", "applied": bool}.
+    Editor-only — any authenticated editor can set.
+    """
+    adj_id = payload.get("adjustment_id")
+    applied = bool(payload.get("applied", True))
+    if not adj_id:
+        return _j({"ok": False, "error": "adjustment_id required"}, 400)
+
+    overrides = dict(_state.get("market_adjustment_overrides") or {})
+    overrides[adj_id] = applied
+    _state["market_adjustment_overrides"] = overrides
+
+    return _j({"ok": True, "adjustment_id": adj_id, "applied": applied})
 
 
 # ═══ Scenarios screen (v18f) ═══

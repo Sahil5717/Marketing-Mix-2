@@ -156,6 +156,15 @@ export function Diagnosis({
         {activeTab === "findings" && (
           <TwoColumn>
             <MainColumn>
+              {/* Market snippet — interpretive cross-reference of current
+                  market conditions against the findings below. Hidden when
+                  no external data has been loaded. Sits above the findings
+                  list because understanding market conditions changes the
+                  priority of the findings. */}
+              {data.market_snippet && (
+                <MarketSnippetCard snippet={data.market_snippet} />
+              )}
+
               <FindingsHead>
                 <FindingsTitle>What the analysis surfaces</FindingsTitle>
                 <FindingsMeta>
@@ -383,6 +392,73 @@ function MarketContextCard({ context }) {
       </MCFooter>
     </SidebarCard>
   );
+}
+
+/**
+ * MarketSnippetCard — interpretive cross-reference of market signals
+ * against the findings list. Sits at the TOP of the Findings tab when
+ * external market data is present.
+ *
+ * Distinguishes from MarketContextCard (sidebar, raw data): this card
+ * connects market conditions to specific findings ("Makes Finding X
+ * more urgent because...").
+ *
+ * Signals ranked by urgency: high first (drawing analyst attention to
+ * time-sensitive moves), then medium, then low opportunities.
+ */
+function MarketSnippetCard({ snippet }) {
+  if (!snippet || !snippet.interpretations || snippet.interpretations.length === 0) {
+    return null;
+  }
+
+  const interpretations = [...snippet.interpretations].sort((a, b) => {
+    const order = { high: 0, medium: 1, low: 2 };
+    return (order[a.urgency] ?? 3) - (order[b.urgency] ?? 3);
+  });
+
+  return (
+    <SnippetWrap>
+      <SnippetHead>
+        <SnippetEyebrow>
+          <SnippetDot />
+          CURRENT MARKET CONDITIONS
+        </SnippetEyebrow>
+        <SnippetHeadline>{snippet.headline}</SnippetHeadline>
+        <SnippetSummary>{snippet.summary_paragraph}</SnippetSummary>
+      </SnippetHead>
+
+      <SnippetBody>
+        {interpretations.map((interp, i) => (
+          <SnippetItem key={i}>
+            <SnippetKindBadge $kind={interp.kind}>
+              {kindLabel(interp.kind)}
+            </SnippetKindBadge>
+            <SnippetContent>
+              <SnippetSignalRow>
+                <SnippetSignal>{interp.signal}</SnippetSignal>
+                <SnippetUrgency $urgency={interp.urgency}>
+                  {interp.urgency}
+                </SnippetUrgency>
+              </SnippetSignalRow>
+              <SnippetImplication>{interp.implication}</SnippetImplication>
+              {interp.related_finding_key && (
+                <SnippetLink>
+                  ↔ Linked to a finding below
+                </SnippetLink>
+              )}
+            </SnippetContent>
+          </SnippetItem>
+        ))}
+      </SnippetBody>
+    </SnippetWrap>
+  );
+}
+
+function kindLabel(kind) {
+  if (kind === "event") return "Event";
+  if (kind === "cost_trend") return "Cost";
+  if (kind === "competitive") return "SOV";
+  return kind;
 }
 
 function formatDaysAway(days) {
@@ -801,4 +877,145 @@ const MCFooter = styled.div`
   font-family: ${t.font.body};
   font-size: ${t.size.xs};
   color: ${t.color.ink3};
+`;
+
+// ─── Market snippet card ───
+
+const SnippetWrap = styled.section`
+  margin-bottom: ${t.space[6]};
+  background: ${t.color.surface};
+  border: 1px solid ${t.color.border};
+  border-left: 3px solid ${t.color.accent};
+  border-radius: ${t.radius.md};
+  box-shadow: ${t.shadow.card};
+  overflow: hidden;
+`;
+
+const SnippetHead = styled.div`
+  padding: ${t.space[5]} ${t.space[5]} ${t.space[4]};
+  background: linear-gradient(to bottom, ${t.color.sunken}, ${t.color.surface});
+  border-bottom: 1px solid ${t.color.borderFaint};
+`;
+
+const SnippetEyebrow = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.accent};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  margin-bottom: ${t.space[2]};
+`;
+
+const SnippetDot = styled.span`
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: ${t.color.accent};
+`;
+
+const SnippetHeadline = styled.h3`
+  font-family: ${t.font.serif};
+  font-size: ${t.size.lg};
+  font-weight: ${t.weight.medium};
+  color: ${t.color.ink};
+  line-height: ${t.leading.tight};
+  margin: 0 0 ${t.space[2]};
+`;
+
+const SnippetSummary = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+`;
+
+const SnippetBody = styled.div`
+  padding: ${t.space[3]} ${t.space[5]};
+`;
+
+const SnippetItem = styled.div`
+  display: flex;
+  gap: ${t.space[4]};
+  padding: ${t.space[4]} 0;
+  border-bottom: 1px solid ${t.color.borderFaint};
+
+  &:last-child { border-bottom: none; }
+`;
+
+const SnippetKindBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 56px;
+  height: 24px;
+  padding: 0 ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  border-radius: ${t.radius.sm};
+  ${({ $kind }) => {
+    if ($kind === "event") return `background: ${t.color.accentSub}; color: ${t.color.accentInk};`;
+    if ($kind === "cost_trend") return `background: ${t.color.sunken}; color: ${t.color.ink2};`;
+    if ($kind === "competitive") return `background: ${t.color.positiveBg}; color: ${t.color.positive};`;
+    return `background: ${t.color.sunken}; color: ${t.color.ink3};`;
+  }}
+`;
+
+const SnippetContent = styled.div`
+  flex: 1;
+`;
+
+const SnippetSignalRow = styled.div`
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: ${t.space[3]};
+  margin-bottom: ${t.space[2]};
+`;
+
+const SnippetSignal = styled.div`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  font-weight: ${t.weight.semibold};
+  color: ${t.color.ink};
+`;
+
+const SnippetUrgency = styled.span`
+  flex-shrink: 0;
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-weight: ${t.weight.semibold};
+  text-transform: uppercase;
+  letter-spacing: ${t.tracking.wider};
+  padding: 1px ${t.space[2]};
+  border-radius: ${t.radius.sm};
+  ${({ $urgency }) => {
+    if ($urgency === "high") return `background: ${t.color.negativeBg}; color: ${t.color.negative};`;
+    if ($urgency === "medium") return `background: ${t.color.accentSub}; color: ${t.color.accentInk};`;
+    return `background: ${t.color.sunken}; color: ${t.color.ink3};`;
+  }}
+`;
+
+const SnippetImplication = styled.p`
+  font-family: ${t.font.body};
+  font-size: ${t.size.sm};
+  color: ${t.color.ink2};
+  line-height: ${t.leading.relaxed};
+  margin: 0;
+`;
+
+const SnippetLink = styled.div`
+  margin-top: ${t.space[2]};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  font-style: italic;
+  color: ${t.color.accent};
 `;
