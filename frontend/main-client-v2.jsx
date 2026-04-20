@@ -5,6 +5,7 @@ import PlanV2 from "./client/PlanV2.jsx";
 import ScenariosV2 from "./client/ScenariosV2.jsx";
 import ChannelDetailV2 from "./client/ChannelDetailV2.jsx";
 import MarketContextV2 from "./client/MarketContextV2.jsx";
+import LoginV2 from "./client/LoginV2.jsx";
 import V2Sandbox from "./client/V2Sandbox.jsx";
 
 /**
@@ -77,6 +78,7 @@ function App() {
   }
 
   if (screen === "sandbox") return <V2Sandbox />;
+  if (screen === "login") return <LoginV2 />;
   if (screen === "plan") return <PlanV2 onNavigate={navigate} />;
   if (screen === "scenarios") return <ScenariosV2 onNavigate={navigate} />;
   if (screen === "channels" || screen === "channel") {

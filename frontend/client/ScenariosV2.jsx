@@ -180,15 +180,20 @@ export default function ScenariosV2({ onNavigate }) {
       .catch((e) => setErr(String(e)));
   }, []);
 
-  const go = (screen) => {
-    if (onNavigate) onNavigate(screen);
-    else window.location.search = `?screen=${screen}`;
+  const go = (screen, params = {}) => {
+    if (onNavigate) onNavigate(screen, params);
+    else {
+      const url = new URL(window.location.href);
+      url.searchParams.set("screen", screen);
+      Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
+      window.location.href = url.toString();
+    }
   };
 
   if (err) {
     return (
       <Canvas>
-        <AppHeader currentScreen="scenarios" />
+        <AppHeader currentScreen="scenarios" v2Mode />
         <Page>
           <ErrorPane>
             Could not load scenarios: {err}. Make sure the backend is running and
@@ -203,7 +208,7 @@ export default function ScenariosV2({ onNavigate }) {
   if (!data) {
     return (
       <Canvas>
-        <AppHeader currentScreen="scenarios" />
+        <AppHeader currentScreen="scenarios" v2Mode />
         <Page>
           <LoadingPane>Loading Scenarios…</LoadingPane>
         </Page>
@@ -223,6 +228,7 @@ export default function ScenariosV2({ onNavigate }) {
     <Canvas>
       <AppHeader
         currentScreen="scenarios"
+        v2Mode
         engagementMeta={{ client: "Acme Retail", period: "Q3 2026" }}
       />
       <Page>

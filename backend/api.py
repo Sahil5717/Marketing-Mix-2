@@ -4719,6 +4719,18 @@ if frontend_dist_dir:
         """
         return _serve_html("index-client-v2.html")
 
+    @app.get("/v2/login", response_class=HTMLResponse)
+    def serve_v2_login_friendly():
+        """
+        Friendly path for the v25 login screen. Serves the same v2 HTML —
+        the React router reads ?screen=login from the URL on the client
+        side. We append the query param server-side via a redirect so
+        bookmarked /v2/login lands users on the login screen directly
+        rather than on Diagnosis (the v2 default).
+        """
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/v2?screen=login", status_code=302)
+
     @app.get("/index-client-v2.html", response_class=HTMLResponse)
     def serve_v2_direct():
         return _serve_html("index-client-v2.html")

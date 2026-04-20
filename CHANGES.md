@@ -1,3 +1,171 @@
+# CHANGES — v25 (MarketLens client redesign, Sessions 1–16)
+
+**Shipped:** 16-session parallel rebuild of the client surface at `/v2`.
+v24 remains fully operational and untouched at `/` and `/editor`. Behind
+a decision gate: v25 becomes the primary surface once stakeholders
+approve at the Partner pitch.
+
+## Summary of work
+
+**Backend (additive — no v24 endpoints modified):**
+- `/api/v2/diagnosis` — 3-pillar reshape: Revenue / Cost / CX with per-pillar
+  metrics, top-3 opportunities, reviewer metadata
+- `/api/v2/plan` — hero + 5 KPI tiles + market overlay + moves grouped by pillar
+- `/api/v2/scenarios` — three side-by-side scenarios (Baseline / Recommended /
+  Aggressive at +15% budget) + 12-channel comparison table
+- `/api/v2/channel/{channel}` — pillars-hit classification + response curve
+  with HDI + vitals + recommendations
+- `/api/v2/market-context` — pillar-affected event classification + cost alert
+  narratives + competitive SOV
+- New engines: `cx_engine.py` (funnel friction / orchestration gap /
+  frequency fatigue), `portfolio_kpis.py` (ROI / MER / LTV:CAC with QoQ),
+  `pillar_aggregator.py` (reshape logic + `_pretty()` helper)
+- Route additions: `GET /v2` · `GET /v2/login` (302→query param) ·
+  `GET /index-client-v2.html`
+
+**Frontend (additive — v24 client/editor/login untouched):**
+- 6 new screen components at `frontend/client/*.jsx`:
+  DiagnosisV2, PlanV2, ScenariosV2, ChannelDetailV2, MarketContextV2, LoginV2
+- 14 shared components at `frontend/client/ui/v2/`:
+  ActionChip, ConfidenceChip, KpiTile, OpportunityRow, PillarCard,
+  MarketContextTile, NextStepsTile, DiagnosisHero, PlanMoveRow,
+  MarketOverlayBanner, ScenarioCard, ChannelComparisonTable,
+  ResponseCurveChart (SVG, no recharts dep), ChannelVitals,
+  ChannelRecommendationRow, MarketEventRow
+- Entry: `main-client-v2.jsx` with SPA routing via pushState + popstate,
+  `index-client-v2.html` loading Libre Caslon Text + Source Sans Pro
+- AppHeader extended with `v2Mode` prop — in v2 mode, Brand logo links
+  to `/v2` and NavItems use SPA routing instead of full reloads; v24
+  behavior unchanged when prop is absent
+- Token additions: pillar colors (rev green / cost amber / cx slate) +
+  soft variants + `fontV2` aliases
+
+**Test suites added (122 total, 1 skip, 0 fail):**
+- `test_cx_engine.py` (11 + 1 skip)
+- `test_pillar_aggregator.py` (11)
+- `test_portfolio_kpis.py` (13)
+- `test_api_v2_diagnosis.py` (14)
+- `test_api_v2_plan.py` (8)
+- `test_api_v2_scenarios.py` (12)
+- `test_api_v2_channel.py` (12)
+- `test_api_v2_market_context.py` (14)
+- `test_v2_frontend.py` (7)
+- `test_v2_login_routing.py` (4)
+- `test_v2_cross_nav.py` (12)
+
+**Bugs caught + fixed during the rebuild:**
+1. CX friction impact $168T — capped at 20% of total revenue
+2. `+-8%` market signal sign bug in Plan — fixed to `{val:+.0f}%` signed format
+3. CX opportunities all labeled "Journey" — added `channel` field at cx_engine
+4. `tv_national` → `Tv National` — added `_ACRONYM_OVERRIDES` dict
+5. Scale vs Shift threshold (<$100K → <$1M or >100% change)
+6. Brand logo in v2 kicked users to `/` (v24) — added `v2Mode` to AppHeader
+7. Nav tabs did full page reloads in v2 — intercepted with pushState
+8. `CPC_TREND` leaked into user-facing copy — stripped `_TREND` suffix
+9. Markov chain + response curve numerical stability edge cases
+10. Dockerfile didn't verify v2 artifacts — added explicit guards
+
+**Known non-blocking issues (flagged, deferred):**
+- Multi-tenancy global `_state` dict (post-pitch hardening)
+- Some secondary CTAs fire `alert("pending")` — listed in rehearsal runbook
+  as "do not click" during the demo
+- CX pillar can dominate pillar distribution on certain optimizer runs —
+  real signal, recovery-factor constant (currently 30%) is tunable
+- Scenarios Aggressive may show ROAS roughly equal to Recommended depending
+  on response-curve saturation — narrative handled in runbook
+
+---
+
+# CHANGES — v24 (MarketLens — Scenarios market overlay, Week 7 closeout)
+
+Closes Week 7 with Scenarios market overlay integration — the third
+piece of the Partner-requested scope (Plan overlay, Diagnosis snippet,
+Scenarios overlay) delivered end-to-end.
+
+## What changed vs v23.2
+
+### Backend: new scenario-specific adjustments endpoint
+
+`GET /api/market-adjustments/scenario?total_budget=X&objective=Y`
+
+Different scenario budgets produce different optimizer runs → different
+moves → different adjustments. The default `/api/market-adjustments`
+is keyed to the default plan budget; this new endpoint computes
+adjustments for whatever budget the scenario is displaying.
+
+Routes through the same `_plan_cache` that `/api/scenario` uses so
+numbers agree exactly. Verified: +25% budget scenario shows moves
+summing to $36.77M, adjustments baseline reports $36.77M — $0 diff.
+
+### Backend: Scenarios default objective alignment
+
+`/api/scenario` defaulted `objective="balanced"` — same bug Plan had.
+Would have caused Plan ↔ Scenarios number mismatch when displaying
+the same budget (Plan uses "maximize_revenue", Scenarios would use
+"balanced" → different optimizer objectives → different allocations).
+Aligned both to `"maximize_revenue"`.
+
+### Frontend: MarketOverlay extracted as shared export
+
+`MarketOverlay` is now exported from Plan.jsx with a new `title` prop.
+Scenarios.jsx imports it instead of duplicating 170 lines of component
+code. Single source of truth for the overlay's visual treatment —
+future changes to styling/behavior apply to both screens.
+
+Header title overridable: Plan shows "PLAN · MARKET OVERLAY",
+Scenarios shows "SCENARIOS · MARKET OVERLAY".
+
+### Frontend: Scenarios integration
+
+- New `marketAdj` state, fetched on mount and on every `runScenario`
+  call (preset switch or custom budget)
+- Overlay renders between the allocation header and the moves list —
+  matches Plan's visual structure
+- Hidden cleanly when scenario has no moves (baseline scenario) or
+  no external market data loaded
+- Analyst override toggle works identically to Plan — optimistic
+  update, shared in-memory override state across screens
+
+### Honest UX decisions
+
+- **Scenario overlay only shows on scenarios with actual moves.**
+  Baseline scenario = current spend = no moves = no adjustments to
+  overlay. Showing an empty overlay there would be confusing noise.
+
+- **Overrides persist across screens.** If analyst toggles off the
+  Diwali adjustment on Plan, it's off on Scenarios too. Same market
+  signal either applies or doesn't — not per-screen.
+
+- **Non-blocking fetch.** Scenario comparison renders immediately;
+  overlay populates when adjustments fetch returns. Preset switches
+  feel responsive even when adjustment recompute is slow.
+
+## Regression: 137/137 green
+
+No new tests (scenario adjustments reuse the well-tested
+market_adjustments engine via the same input shape). All prior suites
+still pass.
+
+## Bundle impact
+
+AppHeader + all screens: +1KB (ES import of MarketOverlay is cheap
+vs duplicating the component). 121KB total, 26KB gzipped.
+
+## What remains — Weeks 8-9
+
+Week 7 scope is CLOSED. All three Partner-requested pieces shipped:
+- ✅ Plan market overlay (v23)
+- ✅ Diagnosis interpretive snippet (v23)
+- ✅ Scenarios market overlay (v24)
+
+Plus all the bug-hunt fixes from the walkthroughs (v23.1, v23.2).
+
+Remaining 2 weeks:
+- Week 8: Deploy v24 to Railway, live walkthrough, fix what we find
+- Week 9: Either time-boxed covariate attempt or pitch rehearsal prep
+
+---
+
 # CHANGES — v23.2 (MarketLens — bug hunt from partner walkthrough)
 
 Bug-fix batch addressing issues Sahil surfaced through screenshot-based

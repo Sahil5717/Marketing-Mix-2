@@ -492,7 +492,7 @@ export default function MarketContextV2({ onNavigate }) {
   if (err) {
     return (
       <Canvas>
-        <AppHeader currentScreen="market" />
+        <AppHeader currentScreen="market" v2Mode />
         <Page>
           <ErrorPane>
             Could not load market context: {err}
@@ -505,7 +505,7 @@ export default function MarketContextV2({ onNavigate }) {
   if (!data) {
     return (
       <Canvas>
-        <AppHeader currentScreen="market" />
+        <AppHeader currentScreen="market" v2Mode />
         <Page>
           <LoadingPane>Loading Market Context…</LoadingPane>
         </Page>
@@ -523,6 +523,7 @@ export default function MarketContextV2({ onNavigate }) {
     <Canvas>
       <AppHeader
         currentScreen="market"
+        v2Mode
         engagementMeta={{ client: "Acme Retail", period: hero.period_label }}
       />
       <Page>

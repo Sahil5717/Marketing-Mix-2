@@ -281,7 +281,7 @@ export default function PlanV2({ onNavigate }) {
   if (err) {
     return (
       <Canvas>
-        <AppHeader currentScreen="plan" />
+        <AppHeader currentScreen="plan" v2Mode />
         <Page>
           <ErrorPane>
             Could not load plan data: {err}. Make sure the backend is running
@@ -295,7 +295,7 @@ export default function PlanV2({ onNavigate }) {
   if (!data) {
     return (
       <Canvas>
-        <AppHeader currentScreen="plan" />
+        <AppHeader currentScreen="plan" v2Mode />
         <Page>
           <LoadingPane>Loading Plan…</LoadingPane>
         </Page>
@@ -322,6 +322,7 @@ export default function PlanV2({ onNavigate }) {
     <Canvas>
       <AppHeader
         currentScreen="plan"
+        v2Mode
         engagementMeta={{ client: "Acme Retail", period: "Q3 2026" }}
       />
       <Page>

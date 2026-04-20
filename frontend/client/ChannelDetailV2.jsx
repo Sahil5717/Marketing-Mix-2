@@ -410,7 +410,7 @@ export default function ChannelDetailV2({ onNavigate, channel }) {
   if (err) {
     return (
       <Canvas>
-        <AppHeader currentScreen="channels" />
+        <AppHeader currentScreen="channels" v2Mode />
         <Page>
           <ErrorPane>
             Could not load channel detail: {err}. Try another channel, or make
@@ -425,7 +425,7 @@ export default function ChannelDetailV2({ onNavigate, channel }) {
   if (!data) {
     return (
       <Canvas>
-        <AppHeader currentScreen="channels" />
+        <AppHeader currentScreen="channels" v2Mode />
         <Page>
           <LoadingPane>Loading channel detail…</LoadingPane>
         </Page>
@@ -453,6 +453,7 @@ export default function ChannelDetailV2({ onNavigate, channel }) {
     <Canvas>
       <AppHeader
         currentScreen="channels"
+        v2Mode
         engagementMeta={{ client: "Acme Retail", period: "Q3 2026" }}
       />
       <Page>

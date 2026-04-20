@@ -191,7 +191,7 @@ export default function DiagnosisV2({ onNavigate }) {
   if (err) {
     return (
       <Canvas>
-        <AppHeader currentScreen="diagnosis" />
+        <AppHeader currentScreen="diagnosis" v2Mode />
         <Page>
           <ErrorPane>
             Could not load diagnosis data: {err}. Make sure the backend is running
@@ -206,7 +206,7 @@ export default function DiagnosisV2({ onNavigate }) {
   if (!data) {
     return (
       <Canvas>
-        <AppHeader currentScreen="diagnosis" />
+        <AppHeader currentScreen="diagnosis" v2Mode />
         <Page>
           <LoadingPane>Loading Diagnosis…</LoadingPane>
         </Page>
@@ -247,6 +247,7 @@ export default function DiagnosisV2({ onNavigate }) {
     <Canvas>
       <AppHeader
         currentScreen="diagnosis"
+        v2Mode
         engagementMeta={{ client: "Acme Retail", period: "Q3 2026" }}
       />
       <Page>
