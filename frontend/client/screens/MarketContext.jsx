@@ -337,12 +337,32 @@ function formatMoney(n) {
 
 function formatDaysAway(days) {
   if (days == null) return "";
-  if (days < 0) return `${Math.abs(days)}d ago`;
+  if (days < 0) {
+    const d = Math.abs(days);
+    if (d < 7) return `${d}d ago`;
+    if (d < 35) {
+      const w = Math.round(d / 7);
+      return `${w} ${w === 1 ? "week" : "weeks"} ago`;
+    }
+    if (d < 365) {
+      const m = Math.round(d / 30);
+      return `${m} ${m === 1 ? "month" : "months"} ago`;
+    }
+    const y = Math.round(d / 365);
+    return `${y} ${y === 1 ? "year" : "years"} ago`;
+  }
   if (days === 0) return "Today";
-  if (days < 7) return `In ${days}d`;
-  if (days < 35) return `In ${Math.round(days / 7)}w`;
-  if (days < 365) return `In ${Math.round(days / 30)} months`;
-  return `In ${Math.round(days / 365)}y`;
+  if (days < 7) return `In ${days} ${days === 1 ? "day" : "days"}`;
+  if (days < 35) {
+    const w = Math.round(days / 7);
+    return `In ${w} ${w === 1 ? "week" : "weeks"}`;
+  }
+  if (days < 365) {
+    const m = Math.round(days / 30);
+    return `In ${m} ${m === 1 ? "month" : "months"}`;
+  }
+  const y = Math.round(days / 365);
+  return `In ${y} ${y === 1 ? "year" : "years"}`;
 }
 
 function formatEventType(t) {

@@ -329,6 +329,9 @@ function formatDate(iso) {
   if (!iso) return "—";
   try {
     const d = new Date(iso);
+    // new Date on malformed strings returns Invalid Date (not throws).
+    // Guard against that rendering as "Invalid Date" in the UI.
+    if (isNaN(d.getTime())) return iso;
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   } catch {
     return iso;

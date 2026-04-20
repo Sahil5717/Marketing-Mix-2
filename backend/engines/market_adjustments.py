@@ -261,6 +261,18 @@ def generate_market_adjustments(
             })
 
     # ── Summary ──────────────────────────────────────────────────────
+    # Filter out adjustments whose dollar impact is below display threshold.
+    # These happen when a channel has a small or zero plan move — the
+    # dampening percentage is mathematically correct but the actual
+    # dollar delta rounds to near-zero, which looks broken in the UI.
+    # We keep them only if they represent a meaningful signal magnitude
+    # (even if the plan move is small, the adjustment's relevance exists).
+    DISPLAY_THRESHOLD = 10_000  # $10K minimum dollar impact to display
+    adjustments = [
+        a for a in adjustments
+        if abs(float(a.get("revenue_delta", 0) or 0)) >= DISPLAY_THRESHOLD
+    ]
+
     applied_delta = sum(
         float(a.get("revenue_delta", 0) or 0)
         for a in adjustments

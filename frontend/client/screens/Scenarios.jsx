@@ -380,7 +380,9 @@ function shortDescription(preset) {
 
 function reliabilityToTier(r) {
   const l = String(r || "").toLowerCase();
-  if (l === "high") return "high";
+  // Match the Plan.jsx mapping: "reliable" is the backend's normal-case
+  // value for solid fits, treated as high-confidence in the UI.
+  if (l === "high" || l === "reliable") return "high";
   if (l === "inconclusive" || l === "low") return "inconclusive";
   return "directional";
 }
@@ -447,8 +449,10 @@ function makeActionHtml(m) {
 
 function descriptor(m) {
   const n = m.narrative || "";
-  const firstSentence = n.split(/[.!?]/)[0];
-  return escapeHtml(firstSentence ? firstSentence + "." : "");
+  // Same sentence-boundary regex as Plan.jsx — don't split on decimals.
+  const match = n.match(/^(.+?[.!?])(?:\s+[A-Z]|\s*$)/);
+  const firstSentence = match ? match[1] : n;
+  return escapeHtml(firstSentence);
 }
 
 function escapeHtml(s) {

@@ -85,6 +85,7 @@ def generate_hero_headline(
     roas: float,
     value_at_risk: float,
     recs: List[Dict],
+    plan_delta: Optional[float] = None,
 ) -> Dict:
     """
     Build the structured answer-first headline for the Diagnosis hero.
@@ -114,10 +115,30 @@ def generate_hero_headline(
         reader both the state and the action in one sentence.
       - Tonal flip only when ROAS is genuinely strong (>=2.5x). If
         ROAS is poor, lead with the concern, not with "above benchmark."
+      - Honest bridging: value_at_risk (from the pillars engine) and
+        plan_delta (from the optimizer) measure different things. VaR
+        is total leakage across the portfolio; plan_delta is what the
+        current-budget reallocation can actually recover. When plan_delta
+        is meaningfully smaller than VaR, we use plan_delta as the
+        "recoverable" figure and add a secondary sentence about the
+        remaining at-risk value.
     """
     var_pct = value_at_risk / max(total_revenue, 1) * 100
     roas_display = f"{roas:.1f}×"
     var_display = _format_dollars(value_at_risk)
+
+    # Bridging logic: if optimizer's plan_delta is meaningfully smaller
+    # than VaR, the honest "recoverable" number is plan_delta, not VaR.
+    # Threshold: plan_delta must be at least 10% smaller to trigger bridging
+    # (small differences are just measurement noise).
+    use_bridged = (
+        plan_delta is not None
+        and plan_delta > 0
+        and value_at_risk > plan_delta * 1.1
+    )
+    recoverable_value = plan_delta if use_bridged else value_at_risk
+    recoverable_display = _format_dollars(recoverable_value) if use_bridged else var_display
+    remaining_at_risk = value_at_risk - recoverable_value if use_bridged else 0
 
     # Segments: (text, emphasis) — emphasis maps to italic+accent in UI.
     # Benchmarks — retail CPG is ~2.5-3.0x, B2B SaaS is ~3.0-4.0x. We use
@@ -130,9 +151,14 @@ def generate_hero_headline(
             {"text": "Portfolio ROAS is "},
             {"text": roas_display, "emphasis": True},
             {"text": " — above benchmark. But "},
-            {"text": var_display, "emphasis": True},
+            {"text": recoverable_display, "emphasis": True},
             {"text": " is recoverable through reallocation."},
         ]
+        if remaining_at_risk > 0:
+            segments.append({
+                "text": f" An additional {_format_dollars(remaining_at_risk)} "
+                        f"is at risk but requires operational changes beyond budget shifts."
+            })
         tone = "positive_with_opportunity"
     elif roas >= 2.8:
         # Strong ROAS, minimal recoverable — congratulations phrasing
@@ -149,9 +175,14 @@ def generate_hero_headline(
             {"text": "Portfolio ROAS of "},
             {"text": roas_display, "emphasis": True},
             {"text": " leaves "},
-            {"text": var_display, "emphasis": True},
+            {"text": recoverable_display, "emphasis": True},
             {"text": " on the table through under-allocated channels."},
         ]
+        if remaining_at_risk > 0:
+            segments.append({
+                "text": f" Additional {_format_dollars(remaining_at_risk)} "
+                        f"requires operational changes beyond reallocation."
+            })
         tone = "mixed"
     else:
         # Poor ROAS — lead with the concern, not with benchmark comparison
@@ -159,9 +190,14 @@ def generate_hero_headline(
             {"text": "Portfolio ROAS of "},
             {"text": roas_display, "emphasis": True},
             {"text": " signals structural over-spend. "},
-            {"text": var_display, "emphasis": True},
+            {"text": recoverable_display, "emphasis": True},
             {"text": " is recoverable through disciplined reallocation."},
         ]
+        if remaining_at_risk > 0:
+            segments.append({
+                "text": f" {_format_dollars(remaining_at_risk)} additional "
+                        f"requires operational improvements."
+            })
         tone = "negative"
 
     # Lede paragraph — provides the "why" in two short sentences. This
@@ -736,8 +772,17 @@ def generate_diagnosis(
     # Structured hero payload for the answer-first v1 design (mockup:
     # Image 2). The existing headline_paragraph stays as a fallback
     # for anything still wired to the old shape.
+    # Extract plan_delta from optimization summary — this is the actual
+    # revenue the reallocation can recover (distinct from value_at_risk
+    # which counts total leakage). When they diverge, the hero honestly
+    # bridges the two numbers.
+    plan_delta = None
+    if optimization:
+        opt_summary = optimization.get("summary", {}) or {}
+        plan_delta = opt_summary.get("revenue_uplift")
     hero = generate_hero_headline(
         total_revenue, roas, value_at_risk, recommendations,
+        plan_delta=plan_delta,
     )
 
     # ── Layer EY editor overrides onto findings ──

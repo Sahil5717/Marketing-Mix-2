@@ -1,3 +1,104 @@
+# CHANGES — v23.2 (MarketLens — bug hunt from partner walkthrough)
+
+Bug-fix batch addressing issues Sahil surfaced through screenshot-based
+walkthroughs of v23. No new features — stability + honesty fixes.
+
+## Critical: Plan ↔ Market Adjustments baseline mismatch
+
+**Root cause:** Two endpoints running the optimizer with different
+objectives. `/api/plan` defaulted `objective="balanced"` while
+`/api/market-adjustments` used `"maximize_revenue"` via the cache
+helper. Two different optimizer runs on the same data produced
+different channel allocations — "Plan says $14M recoverable, Overlay
+shows $24M baseline" is the kind of visible inconsistency a sharp
+partner catches.
+
+**Fix:** Extracted `_default_plan_budget()` and
+`_cached_plan_optimization()` as shared helpers. Both endpoints route
+through them. Default `objective="maximize_revenue"` on both. Verified
+$0 difference between Plan move sum and Market Adjustments baseline
+on every run order.
+
+## Diagnosis headline honest bridging (v23.1)
+
+Previous headline claimed total Value-at-Risk was "recoverable through
+reallocation" — overclaimed when optimizer could only recover a
+fraction. New logic: when VaR > plan_delta by >10%, headline uses
+plan_delta as the recoverable figure and adds an honest secondary
+sentence about the remainder requiring operational changes. VaR KPI
+subtext matches.
+
+Example: "Portfolio ROAS of 2.7× leaves **$14.1M** on the table
+through under-allocated channels. Additional $12.6M requires
+operational changes beyond reallocation."
+
+## Sentence truncation on decimals (v23.1)
+
+Plan + Scenarios MoveCard descriptors truncated at first period —
+including decimals in numbers. "Display currently operates at 1.52x
+ROI..." became "Display currently operates at 1." Fixed with a regex
+that recognizes sentence boundaries (period+space+capital OR end-of-
+string), not bare periods.
+
+## Reliability "reliable" showed as DIRECTIONAL on every move (v23.1)
+
+Backend returns `reliability: "reliable"` for normal fits. Frontend
+`reliabilityToTier` mapper only recognized "high"/"inconclusive"/"low"
+— "reliable" fell through to "directional". Every well-fit move was
+tagged as low-confidence. Fixed in both Plan.jsx and Scenarios.jsx;
+"reliable" now maps to the high tier.
+
+## Zero-dollar market adjustment filtering (v23.1)
+
+Competitive dampening applied to channels with near-zero plan moves
+produced adjustments with $0.00M revenue impact — looked broken.
+Filter: adjustments below $10K dollar impact are hidden. 9 adjustments
+on mock data became 8; no more misleading zero-dollar cards.
+
+## Mock market data generation (shipped in v23, documented here)
+
+`/api/load-mock-data` now generates events + cost trends + competitive
+data alongside campaign data so the demo flow works without CSV
+uploads. All three flow through the same processors CSV uploads use
+— mock and real data share the same code path.
+
+Mock events include: Diwali 2026 (+22%), Black Friday 2026 (+18%),
+Competitor IPL Sponsorship (-8%), past Independence Day for context.
+Mock trends: Paid Search CPC +22% YoY, Social Paid CPC +8%, Display
+CPM -13%. Mock competitive: low SOV on TV/OOH (reach-battle losses),
+high on Search/Events.
+
+## Minor fixes (v23.1 & v23.2)
+
+- `formatDaysAway` inconsistency on MarketContext screen — was
+  abbreviated ("3w") and grammatically wrong ("1 months"). Unified
+  with Diagnosis's correct singularized formatter.
+- `Engagements` date parser — `new Date("bad")` returns Invalid Date
+  silently. Added `isNaN(d.getTime())` guard so malformed timestamps
+  don't render as "Invalid Date" in the UI.
+- `ChannelDetail` campaign ROAS null/Infinity check — a $0-spend
+  campaign would have crashed the table row.
+- `ChannelDetail` secondary curve R² null check.
+- `Plan` Compare pane Bayesian cell — tightened null-check to
+  validate both point value and HDI array shape before rendering.
+
+## Regression: 137/137 green
+
+69 integration + 30 market adjustments + 18 MMM + 20 optimizer
+
+## What the walkthrough taught us
+
+Five real bugs in two walkthroughs that unit tests never caught.
+Pattern: UI renders data that looks plausible but is subtly wrong
+(dishonest number bridging, unmapped enums, regex edge cases,
+null-safety gaps). These only show up when someone actually reads
+the screen.
+
+Going forward: every feature addition earns a 5-minute walkthrough
+on the deployed instance before we call it done.
+
+---
+
 # CHANGES — v23 (MarketLens — Market overlay on Plan + Diagnosis snippet, Week 7 of 9-week plan)
 
 Week 7 of the extended 9-week pitch prep. Addresses the Partner's

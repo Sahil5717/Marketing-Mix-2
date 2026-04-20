@@ -200,6 +200,9 @@ def load_mock_data():
     # so the demo flow shows adjustments without requiring CSV uploads.
     # Same processors handle both — mock just provides the dataframes.
     reporting_df = _state["campaign_data"]
+    # Flag so the UI can indicate "this is sample data" in editor view.
+    # Cleared the moment real CSV uploads replace any of these.
+    _state["_mock_market_data"] = True
     try:
         if "market_events" in data:
             _state["events_result"] = process_market_events(
@@ -287,6 +290,7 @@ async def upload_competitive(file: UploadFile = File(...)):
         missing = required - set(df.columns)
         if missing: raise HTTPException(400, f"Missing columns: {missing}. Required: {required}")
         _state["external_competitive"] = df
+        _state["_mock_market_data"] = False
         # Process immediately if campaign data exists
         if _state["campaign_data"] is not None:
             reporting_df = _state["reporting_data"] if _state.get("reporting_data") is not None else _state["campaign_data"]
@@ -314,6 +318,7 @@ async def upload_events(file: UploadFile = File(...)):
         missing = required - set(df.columns)
         if missing: raise HTTPException(400, f"Missing columns: {missing}. Required: {required}")
         _state["external_events"] = df
+        _state["_mock_market_data"] = False  # real upload overrides mock flag
         if _state["campaign_data"] is not None:
             reporting_df = _state["reporting_data"] if _state.get("reporting_data") is not None else _state["campaign_data"]
             _state["events_result"] = process_market_events(df, reporting_df)
@@ -340,6 +345,7 @@ async def upload_trends(file: UploadFile = File(...)):
         missing = required - set(df.columns)
         if missing: raise HTTPException(400, f"Missing columns: {missing}. Required: {required}")
         _state["external_trends"] = df
+        _state["_mock_market_data"] = False
         if _state["campaign_data"] is not None:
             reporting_df = _state["reporting_data"] if _state.get("reporting_data") is not None else _state["campaign_data"]
             _state["trends_result"] = process_market_trends(df, reporting_df)
@@ -1853,6 +1859,7 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
             competitive_result=_state.get("competitive_result"),
         )
         if market_snippet:
+            market_snippet["_is_mock_data"] = bool(_state.get("_mock_market_data"))
             result["market_snippet"] = market_snippet
     except Exception as e:
         import logging
@@ -1890,11 +1897,23 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
     # "13% of attributable revenue" as the context for this KPI.
     if isinstance(kpis.get("value_at_risk"), dict):
         risk = pillars_state.get("total_value_at_risk", 0)
-        # Total revenue from the reporting data
+        # Honestly bridge VaR vs optimizer plan_delta. When the optimizer
+        # can only recover a fraction of total VaR via reallocation, say so.
+        opt_summary = (_state.get("optimization") or {}).get("summary", {}) or {}
+        plan_delta = opt_summary.get("revenue_uplift") or 0
         try:
             total_rev = float(df["revenue"].sum())
             pct_of_rev = (risk / total_rev * 100) if total_rev > 0 else 0
-            kpis["value_at_risk"]["delta_text"] = "Recoverable via reallocation"
+            if plan_delta > 0 and risk > plan_delta * 1.1:
+                plan_delta_display = (
+                    f"${plan_delta/1e6:.1f}M" if plan_delta >= 1e6
+                    else f"${plan_delta/1e3:.0f}K"
+                )
+                kpis["value_at_risk"]["delta_text"] = (
+                    f"{plan_delta_display} recoverable via reallocation"
+                )
+            else:
+                kpis["value_at_risk"]["delta_text"] = "Recoverable via reallocation"
             kpis["value_at_risk"]["delta_direction"] = "down"
             kpis["value_at_risk"]["pct_of_revenue_display"] = f"{pct_of_rev:.1f}% of attributable revenue"
         except Exception:
@@ -2097,7 +2116,7 @@ def get_diagnosis(view: str = "client", engagement_id: str = "default"):
 
 @app.get("/api/plan")
 def get_plan(view: str = "client", engagement_id: str = "default",
-             total_budget: Optional[float] = None, objective: str = "balanced"):
+             total_budget: Optional[float] = None, objective: str = "maximize_revenue"):
     """
     Plan screen payload: the recommended budget reallocation.
 
@@ -2134,40 +2153,26 @@ def get_plan(view: str = "client", engagement_id: str = "default",
     if not _state.get("curves"):
         raise HTTPException(400, "Response curves not fit yet — run /api/run-analysis first")
 
-    # Default budget: current total spend + 5% (same pattern as the
-    # integration test stability fix — gives the optimizer room to show
-    # upside without being asked to cut).
-    if total_budget is None:
-        curves = _state.get("curves", {})
-        current_total = sum(
-            v.get("current_avg_spend", 0) * 12
-            for v in curves.values() if "error" not in v
-        )
-        total_budget = current_total * 1.05
-    total_budget = float(total_budget)
-
-    # Check plan cache. Keyed by (budget, objective) — the two inputs
-    # that actually affect the optimizer's output. Invalidated when
-    # curves change (stored alongside the cached result as an identity
-    # check: if the curves dict object changed, the cache is stale).
-    cache_key = (round(total_budget, 0), objective)
-    curves_identity = id(_state.get("curves"))
-    plan_cache = _state.get("_plan_cache") or {}
-    cached = plan_cache.get(cache_key)
-    if cached and cached.get("curves_identity") == curves_identity:
-        optimization = cached["optimization"]
+    # Plan budget + optimization sourcing. Both /api/plan and
+    # /api/market-adjustments route through _cached_plan_optimization()
+    # which is keyed on _default_plan_budget(). Keeping this shared is
+    # what prevents the two screens from showing disagreeing numbers.
+    #
+    # Explicit budget/objective overrides still supported for custom
+    # callers — they bypass the shared helper and do their own optimize.
+    if total_budget is None and objective == "maximize_revenue":
+        optimization = _cached_plan_optimization()
     else:
+        # Custom budget/objective — run optimizer directly, don't cache.
+        if total_budget is None:
+            total_budget = _default_plan_budget()
+        total_budget = float(total_budget)
         from engines.optimizer import optimize_budget
         optimization = optimize_budget(
             _state["curves"],
             total_budget,
             objective=objective,
         )
-        plan_cache[cache_key] = {
-            "optimization": optimization,
-            "curves_identity": curves_identity,
-        }
-        _state["_plan_cache"] = plan_cache
 
     from engines.narrative_plan import generate_plan
     plan = generate_plan(
@@ -2190,6 +2195,61 @@ def get_plan(view: str = "client", engagement_id: str = "default",
 # Overrides are in-memory per session (no DB table for Week 7 — defer if
 # the pitch shows it's actually used). Keyed by adjustment_id.
 
+
+def _default_plan_budget() -> float:
+    """
+    Canonical plan budget used by /api/plan AND /api/market-adjustments.
+
+    Both endpoints MUST use this same helper so the optimizer cache key
+    matches and both screens show the same moves. If they diverge (e.g.
+    one uses _current_total_spend, the other uses curves-based sum),
+    the optimizer runs twice with different budgets and produces
+    different numbers for "the same plan" — a visible Plan-vs-Overlay
+    mismatch the pitch audience will catch.
+
+    Formula: sum(current_avg_spend × 12) across all fitted channels,
+    times 1.05 headroom.
+    """
+    curves = _state.get("curves", {}) or {}
+    current_total = sum(
+        v.get("current_avg_spend", 0) * 12
+        for v in curves.values() if "error" not in v
+    )
+    return float(current_total * 1.05)
+
+
+def _cached_plan_optimization(objective: str = "maximize_revenue"):
+    """
+    Get the optimization result for the default plan budget, using the
+    shared _plan_cache. Both /api/plan and /api/market-adjustments call
+    this so they see identical moves.
+
+    Returns the optimization dict. Mutates _state["_plan_cache"] as a
+    side effect to prime the cache for subsequent calls.
+    """
+    from engines.optimizer import optimize_budget
+
+    total_budget = _default_plan_budget()
+    cache_key = (round(total_budget, 0), objective)
+    curves_identity = id(_state.get("curves"))
+    plan_cache = _state.get("_plan_cache") or {}
+    cached = plan_cache.get(cache_key)
+    if cached and cached.get("curves_identity") == curves_identity:
+        return cached["optimization"]
+
+    optimization = optimize_budget(
+        _state["curves"],
+        total_budget,
+        objective=objective,
+    )
+    plan_cache[cache_key] = {
+        "optimization": optimization,
+        "curves_identity": curves_identity,
+    }
+    _state["_plan_cache"] = plan_cache
+    return optimization
+
+
 @app.get("/api/market-adjustments")
 def get_market_adjustments(engagement_id: str = "default"):
     """
@@ -2201,11 +2261,7 @@ def get_market_adjustments(engagement_id: str = "default"):
     """
     from engines.market_adjustments import generate_market_adjustments, apply_overrides
 
-    # Get the current plan moves — reuse the same logic as get_plan() but
-    # don't go through the endpoint (would be redundant). Pull optimization
-    # from _state.
-    optimization = _state.get("optimization")
-    if not optimization:
+    if not _state.get("optimization"):
         return _j({
             "adjustments": [],
             "baseline_total_revenue_delta": 0,
@@ -2216,6 +2272,11 @@ def get_market_adjustments(engagement_id: str = "default"):
                 "message": "Run analysis first.",
             },
         })
+
+    # Use the SAME cached optimization that /api/plan uses so the moves
+    # match across screens. Both endpoints route through
+    # _cached_plan_optimization() which is keyed on _default_plan_budget().
+    optimization = _cached_plan_optimization()
 
     # Build moves inline — same call shape as generate_plan uses
     from engines.narrative_plan import build_moves
@@ -2236,6 +2297,10 @@ def get_market_adjustments(engagement_id: str = "default"):
     overrides = _state.get("market_adjustment_overrides", {}) or {}
     if overrides:
         payload = apply_overrides(payload, overrides)
+
+    # Expose mock-data marker so editor UI can show a subtle disclaimer.
+    # Client view doesn't see this flag (UI gates it behind editor mode).
+    payload["_is_mock_data"] = bool(_state.get("_mock_market_data"))
 
     return _j(payload)
 

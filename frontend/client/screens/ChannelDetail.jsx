@@ -286,7 +286,11 @@ export function ChannelDetail({ data: initialData }) {
           <SectionHead>
             <SectionTitle>
               Spend → {curve.secondary_curve.metric_display}
-              <SectionBadge>R² {curve.secondary_curve.diagnostics.r_squared.toFixed(3)}</SectionBadge>
+              {curve.secondary_curve.diagnostics?.r_squared != null && (
+                <SectionBadge>
+                  R² {Number(curve.secondary_curve.diagnostics.r_squared).toFixed(3)}
+                </SectionBadge>
+              )}
             </SectionTitle>
             <SectionCopy>
               The primary signal for this channel. {
@@ -466,7 +470,9 @@ export function ChannelDetail({ data: initialData }) {
                     </Td>
                     <Td $align="right" className="tabular">{formatMoneyDisplay(c.spend)}</Td>
                     <Td $align="right" className="tabular">
-                      <RoasCell $roas={c.roas}>{c.roas.toFixed(2)}×</RoasCell>
+                      <RoasCell $roas={c.roas}>
+                        {c.roas != null && isFinite(c.roas) ? `${c.roas.toFixed(2)}×` : "—"}
+                      </RoasCell>
                     </Td>
                     {!isOffline && (
                       <Td $align="right" className="tabular">
@@ -1138,6 +1144,9 @@ function tierFromLabel(label) {
   const l = String(label).toLowerCase();
   if (l.startsWith("high")) return "high";
   if (l.startsWith("inconclusive") || l.startsWith("low")) return "inconclusive";
+  // "Medium" from backend maps to the mid tier. Default for anything
+  // else is directional (safe fallback).
+  if (l.startsWith("medium") || l.startsWith("mid")) return "directional";
   return "directional";
 }
 

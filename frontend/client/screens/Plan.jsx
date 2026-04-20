@@ -382,6 +382,14 @@ function MarketOverlay({ data, editorMode, onToggle }) {
               </AdjustmentGroup>
             ) : null
           )}
+
+          {editorMode && data._is_mock_data && (
+            <MockDisclaimer>
+              ⓘ These signals are derived from sample market data loaded with
+              demo. Upload client-specific events, cost trends, or competitive
+              intelligence via Workspace to replace — same engine, real numbers.
+            </MockDisclaimer>
+          )}
         </OverlayBody>
       )}
     </OverlayWrap>
@@ -863,7 +871,7 @@ function ComparePane({ moves }) {
               </CompareTd>
 
               <CompareTd $align="center">
-                {r.bayesRoasPoint != null ? (
+                {r.bayesRoasPoint != null && Array.isArray(r.bayesRoasHdi) && r.bayesRoasHdi.length === 2 ? (
                   <>
                     <CompareNumValue>{r.bayesRoasPoint.toFixed(2)}×</CompareNumValue>
                     <CompareNumSub className="tabular">
@@ -949,7 +957,10 @@ function agreementReadCopy(r) {
 
 function reliabilityToTier(r) {
   const l = String(r || "").toLowerCase();
-  if (l === "high") return "high";
+  // "high" and "reliable" both map to the confident tier. The backend
+  // uses "reliable" for moves where the response curve fit is solid;
+  // "high" is a UI-convention synonym we also accept.
+  if (l === "high" || l === "reliable") return "high";
   if (l === "inconclusive" || l === "low") return "inconclusive";
   return "directional";
 }
@@ -1015,9 +1026,14 @@ function makeActionHtml(m) {
 
 function descriptor(m) {
   const n = m.narrative || "";
-  // Shorten the narrative to one sentence for the card view
-  const firstSentence = n.split(/[.!?]/)[0];
-  return escapeHtml(firstSentence ? firstSentence + "." : "");
+  // Take the first full sentence. The previous regex /[.!?]/ split on
+  // ANY period — including decimals like "1.52x" — producing truncated
+  // sentences like "operates at 1." The fix: only split on sentence
+  // terminators that are followed by whitespace + capital letter OR are
+  // at end-of-string. This preserves decimals inside the sentence.
+  const match = n.match(/^(.+?[.!?])(?:\s+[A-Z]|\s*$)/);
+  const firstSentence = match ? match[1] : n;
+  return escapeHtml(firstSentence);
 }
 
 function escapeHtml(s) {
@@ -1996,4 +2012,17 @@ const AdjCardSource = styled.div`
   font-size: ${t.size.xs};
   color: ${t.color.ink4};
   font-style: italic;
+`;
+
+const MockDisclaimer = styled.div`
+  margin-top: ${t.space[5]};
+  padding: ${t.space[3]} ${t.space[4]};
+  background: ${t.color.sunken};
+  border: 1px dashed ${t.color.border};
+  border-radius: ${t.radius.sm};
+  font-family: ${t.font.body};
+  font-size: ${t.size.xs};
+  color: ${t.color.ink3};
+  font-style: italic;
+  line-height: ${t.leading.relaxed};
 `;
