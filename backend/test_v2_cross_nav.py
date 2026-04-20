@@ -54,9 +54,20 @@ def test_v2_default_route_is_v2_html(client):
     assert "<div id=\"root\">" in r.text
 
 
-def test_legacy_root_not_regressed(client):
-    """/ still serves v24 client (not v2). Packaging audit caught this earlier."""
+def test_root_serves_v25_now(client):
+    """
+    / now serves the v25 client (post-promotion). The old v24 client
+    moved to /legacy for comparison/rollback access.
+    """
     r = client.get("/")
+    assert r.status_code == 200
+    assert "clientV2" in r.text, "root should now serve v25 bundle"
+    assert "main-client-v2" in r.text or "clientV2" in r.text
+
+
+def test_legacy_v24_still_accessible(client):
+    """/legacy serves v24 — kept for side-by-side comparison and rollback."""
+    r = client.get("/legacy")
     assert r.status_code == 200
     # v24 HTML references /assets/client-<hash>.js (not clientV2)
     assert "/assets/client-" in r.text

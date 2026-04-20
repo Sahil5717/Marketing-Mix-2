@@ -4691,7 +4691,23 @@ if frontend_dist_dir:
 
     @app.get("/", response_class=HTMLResponse)
     def serve_root():
-        """Default route → MarketLens client (Diagnosis view)."""
+        """
+        Default route → MarketLens v25 client (v5 redesign).
+
+        v25 (the 3-pillar redesign) is now the primary surface. The older
+        v24 client is available at /legacy for parity during transition —
+        useful for comparing renderings or rolling back via a single line
+        change here if anything critical regresses post-pitch.
+        """
+        return _serve_html("index-client-v2.html")
+
+    @app.get("/legacy", response_class=HTMLResponse)
+    def serve_legacy_v24():
+        """
+        Legacy v24 client. Kept accessible at /legacy so we can (a) compare
+        the two renderings side-by-side during QA, and (b) roll back by
+        swapping the two HTML filenames in serve_root() if v25 regresses.
+        """
         return _serve_html("index-client.html")
 
     @app.get("/login", response_class=HTMLResponse)
