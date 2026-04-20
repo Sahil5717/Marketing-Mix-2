@@ -333,6 +333,21 @@ export async function fetchMarketAdjustments() {
 }
 
 /**
+ * Fetch market adjustments for a specific scenario budget. Unlike the
+ * plain /market-adjustments endpoint (which uses the default plan),
+ * this computes adjustments for the scenario's specific budget — so
+ * changing presets on the Scenarios screen surfaces different moves
+ * and different adjustment magnitudes.
+ */
+export async function fetchScenarioMarketAdjustments({ totalBudget, objective } = {}) {
+  const q = new URLSearchParams();
+  if (totalBudget != null) q.set("total_budget", String(totalBudget));
+  if (objective) q.set("objective", objective);
+  const suffix = q.toString() ? `?${q.toString()}` : "";
+  return apiRequest(`/market-adjustments/scenario${suffix}`);
+}
+
+/**
  * Toggle a single adjustment on/off. Editor-only.
  */
 export async function overrideMarketAdjustment(adjustmentId, applied) {

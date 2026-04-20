@@ -2298,9 +2298,91 @@ def get_market_adjustments(engagement_id: str = "default"):
     if overrides:
         payload = apply_overrides(payload, overrides)
 
-    # Expose mock-data marker so editor UI can show a subtle disclaimer.
-    # Client view doesn't see this flag (UI gates it behind editor mode).
-    payload["_is_mock_data"] = bool(_state.get("_mock_market_data"))
+    return _j(payload)
+
+
+@app.get("/api/market-adjustments/scenario")
+def get_scenario_market_adjustments(total_budget: Optional[float] = None,
+                                     objective: str = "maximize_revenue"):
+    """
+    Market adjustments for a specific scenario's budget.
+
+    Scenarios can use non-default budgets (e.g. "aggressive growth" at +25%
+    budget). That different budget produces a different optimizer run →
+    different moves → different adjustments. This endpoint computes the
+    adjustments for the scenario's specific budget, using the same
+    optimizer cache the /api/scenario endpoint uses so numbers agree.
+
+    Query params:
+      total_budget: the scenario's budget. Defaults to current total spend
+                    (baseline scenario), which produces no moves and therefore
+                    no adjustments.
+      objective: kept for parity with /api/scenario, defaults to the same
+                 "maximize_revenue" used across Plan and the default overlay.
+    """
+    from engines.market_adjustments import generate_market_adjustments, apply_overrides
+
+    if not _state.get("optimization") or not _state.get("curves"):
+        return _j({
+            "adjustments": [],
+            "baseline_total_revenue_delta": 0,
+            "adjusted_total_revenue_delta": 0,
+            "summary": {
+                "adjustment_count": 0, "net_delta": 0,
+                "has_market_data": False,
+                "message": "Run analysis first.",
+            },
+        })
+
+    if total_budget is None:
+        total_budget = _current_total_spend()
+    total_budget = float(total_budget)
+
+    # Use the scenario cache the same way /api/scenario does so the two
+    # endpoints show identical numbers for the same budget/objective pair.
+    cache_key = (round(total_budget, 0), objective)
+    curves_identity = id(_state.get("curves"))
+    plan_cache = _state.get("_plan_cache") or {}
+    cached = plan_cache.get(cache_key)
+    if cached and cached.get("curves_identity") == curves_identity:
+        optimization = cached["optimization"]
+    else:
+        from engines.optimizer import optimize_budget
+        optimization = optimize_budget(
+            _state["curves"], total_budget, objective=objective,
+        )
+        plan_cache[cache_key] = {
+            "optimization": optimization,
+            "curves_identity": curves_identity,
+        }
+        _state["_plan_cache"] = plan_cache
+
+    # Build moves for THIS scenario (not the default plan)
+    from engines.narrative_plan import build_moves
+    moves = build_moves(
+        optimization.get("channels", []),
+        curves=_state.get("curves") or {},
+        bayes_result=_state.get("bayes_result"),
+    )
+
+    # Generate adjustments using the scenario's moves — this is the key
+    # difference from /api/market-adjustments which uses default plan moves.
+    payload = generate_market_adjustments(
+        plan_moves=moves,
+        events_result=_state.get("events_result"),
+        trends_result=_state.get("trends_result"),
+        competitive_result=_state.get("competitive_result"),
+    )
+
+    # Apply the same in-memory overrides — analyst's toggle state should
+    # persist across Plan and Scenarios since adjustments represent the
+    # same underlying market signals.
+    overrides = _state.get("market_adjustment_overrides", {}) or {}
+    if overrides:
+        payload = apply_overrides(payload, overrides)
+
+    # Tag the payload with the scenario's budget for the UI to display
+    payload["scenario_total_budget"] = round(total_budget, 0)
 
     return _j(payload)
 
@@ -2391,7 +2473,7 @@ def get_scenario_presets():
 
 @app.get("/api/scenario")
 def get_scenario(total_budget: Optional[float] = None,
-                  objective: str = "balanced",
+                  objective: str = "maximize_revenue",
                   view: str = "client",
                   engagement_id: str = "default"):
     """
@@ -3152,6 +3234,1405 @@ def api_compare_scenarios(ids: str):
 
 
 # ═══════════════════════════════════════════════════════
+#  V2 ENDPOINTS — mockup-shaped output for the rebuilt frontend
+# ═══════════════════════════════════════════════════════
+#
+# These endpoints return data shaped for the v25 MarketLens UI (the one
+# matching the mockups produced in Apr 2026). v1 endpoints remain untouched
+# so that the v24 frontend keeps working during parallel deployment.
+#
+# When the v25 frontend is live on a separate Railway URL, both
+# frontends hit the same backend — v24 reads /api/diagnosis, v25 reads
+# /api/v2/diagnosis.
+
+@app.get("/api/v2/diagnosis")
+def get_diagnosis_v2(engagement_id: str = "default"):
+    """
+    Mockup-shaped Diagnosis payload for the v25 MarketLens frontend.
+
+    Returns three pillars (Revenue Uplift / Cost Reduction / CX Uplift) with
+    per-pillar headlines, metrics, and ranked opportunity lists — plus the
+    portfolio KPI strip and a market-context tile summary.
+
+    Shape:
+    {
+      "hero": {
+        "total_recoverable": float,        # sum across all three pillars
+        "pillar_count": 3,
+        "opportunity_count": int,          # total opportunities
+        "portfolio_roas": float,           # for the hero subtitle
+      },
+      "kpis": {
+        "marketing_roi":    {"value", "delta", "delta_direction", "unit"},
+        "portfolio_roas":   {...},
+        "mer":              {...},
+        "mkt_driven_revenue_pct": {...},
+        "ltv_cac":          {"value": None, "available": bool, "cta": str},
+      },
+      "pillars": {
+        "revenue_uplift": {...},  # see pillar_aggregator.build_revenue_pillar
+        "cost_reduction": {...},
+        "cx_uplift":      {...},
+      },
+      "pillar_order": ["revenue_uplift", "cost_reduction", "cx_uplift"],
+      "market_context_summary": {           # for the right-side tile
+        "events_count": int,
+        "upcoming_events": [{"name", "when", "impact_pct", "direction"}, ...],
+        "cost_alerts_count": int,
+        "top_alert": {"title", "body"} | None,
+      },
+      "reviewer": {"name": str, "role": str, "channels": int, "campaigns": int},
+    }
+    """
+    _ensure_analysis()
+    if _state["campaign_data"] is None:
+        raise HTTPException(400, "No data loaded — upload data or call /api/load-mock-data first")
+
+    df = _state["reporting_data"] if _state["reporting_data"] is not None else _state["campaign_data"]
+
+    # 1. Portfolio KPIs (Marketing ROI, ROAS, MER, Mkt-driven %, LTV:CAC)
+    from engines.portfolio_kpis import compute_portfolio_kpis
+    kpis = compute_portfolio_kpis(df)
+
+    # 2. CX pillar — journey-based opportunities from existing campaign data
+    from engines.cx_engine import run_cx_analysis
+    cx_result = run_cx_analysis(df)
+
+    # 3. Revenue + Cost pillars via aggregator — uses existing optimizer output
+    from engines.pillar_aggregator import aggregate_all_pillars
+    optimizer_result = _state.get("optimization") or {}
+    automated_recs = _state.get("automated_recs") or []
+    market_adj = _state.get("market_adjustments") or {}
+    pillars_payload = aggregate_all_pillars(
+        optimizer_result=optimizer_result,
+        cx_result=cx_result,
+        automated_recs=automated_recs,
+        market_adjustments=market_adj,
+        response_curves=_state.get("curves") or {},
+    )
+
+    # 4. Market-context tile summary (for the right-hand card on Diagnosis).
+    # Uses the real shape from events_result / trends_result as populated by
+    # run-analysis in v24.
+    events_result = _state.get("events_result") or {}
+    trends_result = _state.get("trends_result") or {}
+
+    # Upcoming events — filter to is_upcoming, sort by days_away ascending, cap at 3
+    all_events = events_result.get("events") or []
+    upcoming_raw = [e for e in all_events if e.get("is_upcoming")]
+    upcoming_raw.sort(key=lambda e: e.get("days_away", 9999))
+    upcoming_events = []
+    for ev in upcoming_raw[:3]:
+        days = ev.get("days_away", 0)
+        if days < 7:
+            when = f"In {days} day{'s' if days != 1 else ''}"
+        elif days < 60:
+            when = f"In {days} days"
+        else:
+            months = days // 30
+            when = f"In {months} month{'s' if months != 1 else ''}"
+        impact_pct = float(ev.get("impact_pct", 0))
+        direction = ev.get("direction", "positive")
+        # events engine uses "positive"/"negative"; UI prefers "up"/"down"
+        dir_ui = "up" if direction == "positive" else "down"
+        upcoming_events.append({
+            "name": ev.get("name", "Event"),
+            "when": when,
+            "impact_pct": impact_pct if dir_ui == "up" else -abs(impact_pct),
+            "direction": dir_ui,
+        })
+
+    # Cost alerts — trends_result["cost_adjustments"] is a dict keyed by channel.
+    # Elevate the most material YoY changes into alerts for the UI.
+    cost_adjustments = trends_result.get("cost_adjustments") or {}
+    cost_alerts_list = []
+    if isinstance(cost_adjustments, dict):
+        for channel, adj in cost_adjustments.items():
+            yoy = float(adj.get("yoy_change_pct", 0))
+            if abs(yoy) < 5:  # below 5% isn't newsworthy
+                continue
+            metric = adj.get("metric", "cost_trend").replace("_", " ").upper()
+            direction_word = "up" if yoy > 0 else "down"
+            cost_alerts_list.append({
+                "channel": channel,
+                "title": f"{channel.replace('_', ' ').title()} {metric} {direction_word} {abs(yoy):.0f}% YoY",
+                "body": (
+                    f"{metric}: ${adj.get('trend_start', 0):.2f} → "
+                    f"${adj.get('current_value', 0):.2f} "
+                    f"({yoy:+.0f}% YoY)."
+                ),
+                "direction": direction_word,
+                "yoy_change_pct": yoy,
+            })
+        # Rank by absolute magnitude, largest first
+        cost_alerts_list.sort(key=lambda a: abs(a["yoy_change_pct"]), reverse=True)
+
+    top_alert = None
+    if cost_alerts_list:
+        top_alert = {
+            "title": cost_alerts_list[0]["title"],
+            "body": cost_alerts_list[0]["body"],
+        }
+
+    market_summary = {
+        "events_count": len(upcoming_events),
+        "upcoming_events": upcoming_events,
+        "cost_alerts_count": len(cost_alerts_list),
+        "top_alert": top_alert,
+    }
+
+    # 5. Reviewer line metadata
+    try:
+        n_channels = int(df["channel"].nunique()) if "channel" in df.columns else 0
+    except Exception:
+        n_channels = 0
+    try:
+        n_campaigns = int(df["campaign"].nunique()) if "campaign" in df.columns else 0
+    except Exception:
+        n_campaigns = 0
+    reviewer = {
+        "name": "Sarah Rahman",   # TODO: real user when auth has full name fields
+        "role": "Senior Manager",
+        "channels": n_channels,
+        "campaigns": n_campaigns,
+    }
+
+    # 6. Hero block
+    portfolio_roas_value = kpis.get("portfolio_roas", {}).get("value", 0)
+    hero = {
+        "total_recoverable": pillars_payload["hero"]["total_recoverable"],
+        "pillar_count": pillars_payload["hero"]["pillar_count"],
+        "opportunity_count": pillars_payload["hero"]["opportunity_count"],
+        "portfolio_roas": portfolio_roas_value,
+    }
+
+    return _j({
+        "hero": hero,
+        "kpis": kpis,
+        "pillars": pillars_payload["pillars"],
+        "pillar_order": pillars_payload["pillar_order"],
+        "market_context_summary": market_summary,
+        "reviewer": reviewer,
+    })
+
+
+@app.get("/api/v2/plan")
+def get_plan_v2(engagement_id: str = "default"):
+    """
+    Mockup-shaped Plan payload for the v25 MarketLens frontend.
+
+    Returns the recommended budget reallocation, organized into the same
+    three-pillar structure as /api/v2/diagnosis. Each pillar contains
+    "moves" — concrete spend changes per channel, each with its dollar
+    impact, action verb, confidence, and pillar tag.
+
+    Shape:
+    {
+      "hero": {
+        "expected_lift": float,           # total revenue uplift
+        "expected_lift_pct": float,       # % of current revenue
+        "moves_count": int,
+        "channels_moving": int,
+        "channels_total": int,
+        "spend_shift": float,             # absolute $ moving between channels
+        "plan_confidence": "high"|"directional"|"inconclusive",
+        "execute_by": str,                # "Oct 1" — read from constraints
+        "horizon_days": int,
+      },
+      "kpis": [                           # 5-tile strip
+        {label, value, unit, sub},
+        ...
+      ],
+      "market_overlay": {
+        "applied": bool,
+        "net_impact": float,              # net market headwind/tailwind in $
+        "signals_count": int,
+        "signals": [
+          {label, value_text, direction, source}, ...
+        ],
+      },
+      "moves_by_pillar": {
+        "revenue_uplift":  {headline_value, count, moves: [...]},
+        "cost_reduction":  {...},
+        "cx_uplift":       {...},
+      },
+      "pillar_order": ["revenue_uplift", "cost_reduction", "cx_uplift"],
+      "reviewer": {name, role, channels_count, weeks_of_data},
+    }
+
+    Each move:
+    {
+      action_verb: "Shift"|"Scale"|"Cut Spend"|"Renegotiate"|"Orchestrate"|"Cap Freq",
+      channel: str (display-formatted),
+      title: str,                          # short headline
+      detail: str,                         # one-liner sub
+      current_spend: float,
+      recommended_spend: float,
+      spend_delta: float,                  # signed: + means add, − means cut
+      change_pct: float,                   # signed
+      impact: float,                       # estimated $ benefit
+      pillar: "revenue_uplift"|"cost_reduction"|"cx_uplift",
+      confidence: "high"|"directional"|"inconclusive",
+      urgency_days: int|None,
+    }
+    """
+    _ensure_analysis()
+    if _state["campaign_data"] is None:
+        raise HTTPException(400, "No data loaded — upload data or call /api/load-mock-data first")
+    if not _state.get("optimization"):
+        raise HTTPException(400, "No optimization run yet — call /api/run-analysis first")
+
+    optimizer = _state["optimization"]
+    summary = optimizer.get("summary", {})
+    channels = optimizer.get("channels", [])
+    market_adj = _state.get("market_adjustments") or {}
+    events_result = _state.get("events_result") or {}
+
+    # 1. Collect channel-level moves and group by pillar.
+    # Reuses the same classification logic as the Diagnosis pillar
+    # aggregator: change_pct > 5  → revenue scale/shift,
+    #              change_pct < -5 → cost cut, otherwise → hold.
+    from engines.pillar_aggregator import _pretty
+    moves_revenue = []
+    moves_cost = []
+    moves_cx = []  # CX moves come from automated_recs, not optimizer
+    channels_moving = 0
+    spend_shift_abs = 0.0
+
+    for c in channels:
+        if c.get("locked"):
+            continue
+        ch_raw = c.get("channel", "Unknown")
+        ch = _pretty(ch_raw)
+        current = float(c.get("current_spend", 0))
+        recommended = float(c.get("optimized_spend", 0))
+        change_pct = float(c.get("change_pct", 0))
+        spend_delta = recommended - current
+        revenue_delta = float(c.get("revenue_delta", 0))
+        marginal_roi = float(c.get("marginal_roi", 0))
+
+        if abs(change_pct) < 5:
+            continue  # held steady — not a move
+
+        channels_moving += 1
+        spend_shift_abs += abs(spend_delta)
+
+        # Confidence — large pct change reads as a stronger signal
+        if abs(change_pct) >= 25:
+            confidence = "high"
+        elif abs(change_pct) >= 10:
+            confidence = "directional"
+        else:
+            confidence = "inconclusive"
+
+        if change_pct > 0:
+            # Revenue Uplift move
+            if current < 1e6 or change_pct > 100:
+                action_verb = "Scale"
+                title = f"Scale {ch} spend by {change_pct:+.0f}%"
+                detail = f"Marginal ROAS {marginal_roi:.1f}× — response curve has headroom"
+            else:
+                action_verb = "Shift"
+                title = f"Reallocate ${abs(spend_delta)/1e6:.1f}M into {ch}"
+                detail = f"Channel below efficient frontier; +{change_pct:.0f}% recommended"
+
+            moves_revenue.append({
+                "action_verb": action_verb,
+                "channel": ch,
+                "title": title,
+                "detail": detail,
+                "current_spend": round(current, 0),
+                "recommended_spend": round(recommended, 0),
+                "spend_delta": round(spend_delta, 0),
+                "change_pct": round(change_pct, 1),
+                "impact": round(revenue_delta, 0),
+                "pillar": "revenue_uplift",
+                "confidence": confidence,
+                "urgency_days": None,
+            })
+        else:
+            # Cost Reduction move
+            cost_saving = abs(spend_delta)
+            moves_cost.append({
+                "action_verb": "Cut Spend",
+                "channel": ch,
+                "title": f"Reduce {ch} spend by {abs(change_pct):.0f}%",
+                "detail": f"Past efficient frontier; recommended ${recommended/1e6:.1f}M",
+                "current_spend": round(current, 0),
+                "recommended_spend": round(recommended, 0),
+                "spend_delta": round(spend_delta, 0),
+                "change_pct": round(change_pct, 1),
+                "impact": round(cost_saving, 0),
+                "pillar": "cost_reduction",
+                "confidence": confidence,
+                "urgency_days": None,
+            })
+
+    # 2. Pull CX moves from cx_engine. Different mechanism — these are
+    #    journey/orchestration/frequency actions, not budget reallocations.
+    from engines.cx_engine import run_cx_analysis
+    df = _state["reporting_data"] if _state["reporting_data"] is not None else _state["campaign_data"]
+    cx_result = run_cx_analysis(df)
+    for opp in cx_result.get("opportunities", [])[:6]:  # cap at top 6 CX moves
+        ch = _pretty(opp.get("channel") or "Journey")
+        moves_cx.append({
+            "action_verb": opp.get("action_verb", "Orchestrate"),
+            "channel": ch,
+            "title": opp.get("title", ""),
+            "detail": opp.get("detail", ""),
+            "current_spend": None,
+            "recommended_spend": None,
+            "spend_delta": None,
+            "change_pct": None,
+            "impact": round(float(opp.get("estimated_impact", 0)), 0),
+            "pillar": "cx_uplift",
+            "confidence": opp.get("confidence", "directional"),
+            "urgency_days": None,
+        })
+
+    # 3. Add urgency-tagged moves from upcoming events (e.g. Diwali window)
+    upcoming = sorted(
+        [e for e in (events_result.get("events") or []) if e.get("is_upcoming")],
+        key=lambda e: e.get("days_away", 9999),
+    )
+    for ev in upcoming[:1]:  # only the most imminent positive event
+        if (ev.get("impact_pct", 0) or 0) <= 0:
+            continue
+        ch = _pretty((ev.get("affected_channels") or ["events"])[0])
+        moves_revenue.insert(0, {
+            "action_verb": "Scale",
+            "channel": ch,
+            "title": f"Scale {ch} for {ev.get('name', 'event')} window",
+            "detail": (
+                f"+{ev.get('impact_pct', 0):.0f}% baseline lift expected · "
+                f"{ev.get('days_away', 0)}-day window"
+            ),
+            "current_spend": None,
+            "recommended_spend": None,
+            "spend_delta": None,
+            "change_pct": None,
+            "impact": None,  # event uplift is multiplicative, not a fixed $
+            "pillar": "revenue_uplift",
+            "confidence": "directional",
+            "urgency_days": int(ev.get("days_away", 0)),
+        })
+
+    # Sort each pillar by impact (None last)
+    def _sort_key(m):
+        return -(m.get("impact") or 0)
+    moves_revenue.sort(key=_sort_key)
+    moves_cost.sort(key=_sort_key)
+    moves_cx.sort(key=_sort_key)
+
+    # 4. Hero KPIs
+    expected_lift = float(summary.get("revenue_uplift", 0))
+    current_revenue = float(summary.get("current_revenue", 0))
+    expected_lift_pct = (expected_lift / current_revenue * 100) if current_revenue > 0 else 0
+    moves_count = len(moves_revenue) + len(moves_cost) + len(moves_cx)
+    channels_total = len([c for c in channels if not c.get("locked")])
+
+    # Plan confidence — average of high-magnitude moves
+    high_count = sum(1 for m in moves_revenue + moves_cost if m.get("confidence") == "high")
+    if high_count >= 3:
+        plan_confidence = "high"
+    elif high_count >= 1:
+        plan_confidence = "directional"
+    else:
+        plan_confidence = "inconclusive"
+
+    # 5. Market overlay block
+    cost_adjustments = (_state.get("trends_result") or {}).get("cost_adjustments") or {}
+    overlay_signals = []
+    net_impact = 0.0
+    # Top upcoming positive event
+    if upcoming:
+        ev = upcoming[0]
+        impact_pct_signed = float(ev.get("impact_pct", 0) or 0)
+        overlay_signals.append({
+            "label": ev.get("name", "Event"),
+            "value_text": f"{impact_pct_signed:+.0f}% · {ev.get('days_away', 0)}d",
+            "direction": "up" if impact_pct_signed > 0 else "down",
+            "source": "events",
+        })
+    # Top cost trend (CPC up = headwind)
+    if isinstance(cost_adjustments, dict):
+        for chn, adj in list(cost_adjustments.items())[:2]:
+            yoy = float(adj.get("yoy_change_pct", 0))
+            metric = adj.get("metric", "trend").replace("_", " ")
+            overlay_signals.append({
+                "label": f"{_pretty(chn)} {metric}",
+                "value_text": f"{yoy:+.0f}% YoY",
+                "direction": "down" if yoy > 0 else "up",  # rising cost = headwind
+                "source": "trends",
+            })
+            # Approximate net dollar impact: CPC inflation eats into channel spend efficiency
+            ch_match = next((c for c in channels if c.get("channel") == chn), None)
+            if ch_match and yoy > 0:
+                # Negative impact ≈ channel spend × (yoy% × 0.3 efficiency drag)
+                net_impact -= float(ch_match.get("current_spend", 0)) * (yoy / 100) * 0.3
+
+    market_overlay = {
+        "applied": len(overlay_signals) > 0,
+        "net_impact": round(net_impact, 0),
+        "signals_count": len(overlay_signals),
+        "signals": overlay_signals,
+    }
+
+    # 6. Five KPI tiles
+    kpis = [
+        {
+            "label": "Expected lift",
+            "value": expected_lift,
+            "format": "currency_m",
+            "sub": f"+{expected_lift_pct:.0f}% vs current",
+        },
+        {
+            "label": "Channels moving",
+            "value": channels_moving,
+            "format": "ratio",
+            "denom": channels_total,
+            "sub": f"{channels_total - channels_moving} hold steady",
+        },
+        {
+            "label": "Spend shift",
+            "value": spend_shift_abs,
+            "format": "currency_m",
+            "sub": "reallocation · within budget",
+        },
+        {
+            "label": "Plan confidence",
+            "value": plan_confidence.title(),
+            "format": "label",
+            "sub": "from optimizer + Bayesian MMM",
+        },
+        {
+            "label": "Execute by",
+            "value": "Oct 1",   # static default; ties to constraint lead times
+            "format": "date",
+            "sub": "90-day horizon",
+        },
+    ]
+
+    # 7. Reviewer
+    try:
+        n_channels = int(df["channel"].nunique()) if "channel" in df.columns else 0
+    except Exception:
+        n_channels = 0
+    try:
+        weeks = int(df["month"].nunique() * 4.3) if "month" in df.columns else 0
+    except Exception:
+        weeks = 0
+    reviewer = {
+        "name": "Sarah Rahman",
+        "role": "Senior Manager",
+        "channels_count": n_channels,
+        "weeks_of_data": weeks,
+    }
+
+    # 8. Hero
+    hero = {
+        "expected_lift": round(expected_lift, 0),
+        "expected_lift_pct": round(expected_lift_pct, 1),
+        "moves_count": moves_count,
+        "channels_moving": channels_moving,
+        "channels_total": channels_total,
+        "spend_shift": round(spend_shift_abs, 0),
+        "plan_confidence": plan_confidence,
+        "execute_by": "Oct 1",
+        "horizon_days": 90,
+    }
+
+    return _j({
+        "hero": hero,
+        "kpis": kpis,
+        "market_overlay": market_overlay,
+        "moves_by_pillar": {
+            "revenue_uplift": {
+                "headline_value": round(sum(m.get("impact") or 0 for m in moves_revenue), 0),
+                "count": len(moves_revenue),
+                "moves": moves_revenue,
+            },
+            "cost_reduction": {
+                "headline_value": round(sum(m.get("impact") or 0 for m in moves_cost), 0),
+                "count": len(moves_cost),
+                "moves": moves_cost,
+            },
+            "cx_uplift": {
+                "headline_value": round(sum(m.get("impact") or 0 for m in moves_cx), 0),
+                "count": len(moves_cx),
+                "moves": moves_cx,
+            },
+        },
+        "pillar_order": ["revenue_uplift", "cost_reduction", "cx_uplift"],
+        "reviewer": reviewer,
+    })
+
+
+@app.get("/api/v2/scenarios")
+def get_scenarios_v2(engagement_id: str = "default"):
+    """
+    Mockup-shaped Scenarios payload for the v25 frontend.
+
+    Returns three side-by-side scenarios for the Scenarios screen:
+      - baseline:    hold current spend allocation (the "do nothing" anchor)
+      - recommended: optimizer's best plan at current total budget
+                     (matches /api/v2/plan)
+      - aggressive:  optimizer's best plan with +15% total budget
+
+    Plus a channel-level comparison table showing per-channel spend under
+    each scenario.
+
+    Shape:
+    {
+      "hero": {scenarios_count, recommended_lift, channels_in_play},
+      "scenarios": [
+        {key, label, badge, selected, hero_value, hero_value_format,
+         description, moves_count, pillar_split, stats}, ...
+      ],
+      "channel_table": {columns, rows, totals},
+      "reviewer": {name, role, channels_modeled, hdi_pct},
+    }
+
+    The selected scenario is always "recommended" by default — the UI
+    flips state locally when the user clicks another card.
+    """
+    _ensure_analysis()
+    if _state["campaign_data"] is None:
+        raise HTTPException(400, "No data loaded — upload data or call /api/load-mock-data first")
+    if not _state.get("curves"):
+        raise HTTPException(400, "Response curves not fit yet — run /api/run-analysis first")
+    if not _state.get("optimization"):
+        raise HTTPException(400, "No optimization run yet — call /api/run-analysis first")
+
+    from engines.optimizer import optimize_budget
+    from engines.pillar_aggregator import _pretty
+
+    current_spend = _current_total_spend()
+    curves = _state["curves"]
+
+    # Recommended = cached optimizer result from run-analysis.
+    recommended_opt = _state["optimization"]
+
+    # Aggressive = +15% budget. Reuse Plan cache so numbers stay stable.
+    aggressive_budget = current_spend * 1.15
+    plan_cache = _state.get("_plan_cache") or {}
+    cache_key = (round(aggressive_budget, 0), "maximize_revenue")
+    curves_identity = id(curves)
+    cached = plan_cache.get(cache_key)
+    if cached and cached.get("curves_identity") == curves_identity:
+        aggressive_opt = cached["optimization"]
+    else:
+        aggressive_opt = optimize_budget(curves, aggressive_budget, objective="maximize_revenue")
+        plan_cache[cache_key] = {
+            "optimization": aggressive_opt,
+            "curves_identity": curves_identity,
+        }
+        _state["_plan_cache"] = plan_cache
+
+    # Baseline = current allocation held steady.
+    baseline_channels = []
+    baseline_total_rev = 0.0
+    baseline_total_spend = 0.0
+    for c in recommended_opt.get("channels", []):
+        ch = c.get("channel", "Unknown")
+        cur_spend = float(c.get("current_spend", 0))
+        cur_rev = float(c.get("current_revenue", 0))
+        baseline_channels.append({"channel": ch, "spend": cur_spend, "revenue": cur_rev})
+        baseline_total_spend += cur_spend
+        baseline_total_rev += cur_rev
+
+    # Pillar-split helper: classifies per-channel moves into Revenue/Cost
+    # dollar values. CX is shared across scenarios — derived from historical
+    # data, not budget reallocation — so all three see the same CX value.
+    def _pillar_split(opt_result):
+        split = {"revenue_uplift": 0.0, "cost_reduction": 0.0, "cx_uplift": 0.0}
+        for c in opt_result.get("channels", []):
+            change_pct = float(c.get("change_pct", 0))
+            rev_delta = float(c.get("revenue_delta", 0))
+            spend_delta = float(c.get("optimized_spend", 0)) - float(c.get("current_spend", 0))
+            if change_pct > 5 and rev_delta > 0:
+                split["revenue_uplift"] += rev_delta
+            elif change_pct < -5 and spend_delta < 0:
+                split["cost_reduction"] += abs(spend_delta)
+        df = _state["reporting_data"] if _state["reporting_data"] is not None else _state["campaign_data"]
+        try:
+            from engines.cx_engine import run_cx_analysis
+            cx = run_cx_analysis(df)
+            split["cx_uplift"] = float(cx.get("total_estimated_impact", 0))
+        except Exception:
+            split["cx_uplift"] = 0.0
+        return {k: round(v, 0) for k, v in split.items()}
+
+    def _moves_count(opt_result):
+        return sum(1 for c in opt_result.get("channels", []) if abs(c.get("change_pct", 0)) >= 5)
+
+    def _confidence(opt_result):
+        high = sum(1 for c in opt_result.get("channels", []) if abs(c.get("change_pct", 0)) >= 25)
+        if high >= 3:
+            return "high"
+        if high >= 1:
+            return "directional"
+        return "inconclusive"
+
+    recommended_summary = recommended_opt.get("summary", {})
+    aggressive_summary = aggressive_opt.get("summary", {})
+    rec_lift = float(recommended_summary.get("optimized_revenue", 0)) - baseline_total_rev
+    agg_lift = float(aggressive_summary.get("optimized_revenue", 0)) - baseline_total_rev
+
+    scenarios = [
+        {
+            "key": "baseline",
+            "label": "Hold baseline",
+            "badge": "Baseline",
+            "selected": False,
+            "hero_value": 0.0,
+            "hero_value_format": "zero",
+            "description": "Keep today's allocation unchanged.",
+            "moves_count": 0,
+            "pillar_split": {"revenue_uplift": 0.0, "cost_reduction": 0.0, "cx_uplift": 0.0},
+            "stats": {
+                "total_spend": round(baseline_total_spend, 0),
+                "roas": round(baseline_total_rev / max(baseline_total_spend, 1), 2),
+                "confidence": None,
+            },
+        },
+        {
+            "key": "recommended",
+            "label": "Optimizer plan",
+            "badge": "Recommended",
+            "selected": True,
+            "hero_value": round(rec_lift, 0),
+            "hero_value_format": "currency_m",
+            "description": f"Reallocate within budget · {_moves_count(recommended_opt)} moves · no new spend.",
+            "moves_count": _moves_count(recommended_opt),
+            "pillar_split": _pillar_split(recommended_opt),
+            "stats": {
+                "total_spend": round(float(recommended_summary.get("total_budget", 0)), 0),
+                "roas": round(
+                    float(recommended_summary.get("optimized_revenue", 0))
+                    / max(float(recommended_summary.get("total_budget", 1)), 1),
+                    2,
+                ),
+                "confidence": _confidence(recommended_opt),
+            },
+        },
+        {
+            "key": "aggressive",
+            "label": "Aggressive growth",
+            "badge": "Higher risk",
+            "selected": False,
+            "hero_value": round(agg_lift, 0),
+            "hero_value_format": "currency_m",
+            "description": (
+                f"Reallocate + add ${(aggressive_budget - baseline_total_spend)/1e6:.1f}M new spend · "
+                f"{_moves_count(aggressive_opt)} moves."
+            ),
+            "moves_count": _moves_count(aggressive_opt),
+            "pillar_split": _pillar_split(aggressive_opt),
+            "stats": {
+                "total_spend": round(aggressive_budget, 0),
+                "roas": round(
+                    float(aggressive_summary.get("optimized_revenue", 0))
+                    / max(aggressive_budget, 1),
+                    2,
+                ),
+                "confidence": _confidence(aggressive_opt),
+            },
+        },
+    ]
+
+    # Channel-level comparison table (keyed by channel name).
+    rec_by_channel = {c.get("channel"): c for c in recommended_opt.get("channels", [])}
+    agg_by_channel = {c.get("channel"): c for c in aggressive_opt.get("channels", [])}
+
+    channel_rows = []
+    totals = {"baseline": 0.0, "recommended": 0.0, "aggressive": 0.0}
+    for ch_info in baseline_channels:
+        ch_raw = ch_info["channel"]
+        baseline_spend = float(ch_info["spend"])
+        rec = rec_by_channel.get(ch_raw, {})
+        agg = agg_by_channel.get(ch_raw, {})
+        rec_spend = float(rec.get("optimized_spend", baseline_spend))
+        agg_spend = float(agg.get("optimized_spend", baseline_spend))
+
+        change_pct = float(rec.get("change_pct", 0))
+        if change_pct > 5:
+            primary = "revenue_uplift"
+        elif change_pct < -5:
+            primary = "cost_reduction"
+        else:
+            primary = "cx_uplift"
+
+        channel_rows.append({
+            "channel": _pretty(ch_raw),
+            "baseline": round(baseline_spend, 0),
+            "recommended": round(rec_spend, 0),
+            "aggressive": round(agg_spend, 0),
+            "primary_pillar": primary,
+        })
+        totals["baseline"] += baseline_spend
+        totals["recommended"] += rec_spend
+        totals["aggressive"] += agg_spend
+
+    channel_rows.sort(key=lambda r: r["baseline"], reverse=True)
+
+    channel_table = {
+        "columns": ["baseline", "recommended", "aggressive"],
+        "rows": channel_rows,
+        "totals": {k: round(v, 0) for k, v in totals.items()},
+    }
+
+    hero = {
+        "scenarios_count": 3,
+        "recommended_lift": round(rec_lift, 0),
+        "channels_in_play": len(channel_rows),
+    }
+
+    df = _state["reporting_data"] if _state["reporting_data"] is not None else _state["campaign_data"]
+    try:
+        n_channels = int(df["channel"].nunique()) if "channel" in df.columns else 0
+    except Exception:
+        n_channels = 0
+    reviewer = {
+        "name": "Sarah Rahman",
+        "role": "Senior Manager",
+        "channels_modeled": n_channels,
+        "hdi_pct": 90,
+    }
+
+    return _j({
+        "hero": hero,
+        "scenarios": scenarios,
+        "channel_table": channel_table,
+        "reviewer": reviewer,
+    })
+
+
+@app.get("/api/v2/channel/{channel}")
+def get_channel_v2(channel: str, engagement_id: str = "default"):
+    """
+    Mockup-shaped Channel Detail payload for the v25 frontend.
+
+    Returns the three-pillar view of a single channel: the pillars this
+    channel participates in, the response curve with current + recommended
+    spend markers, channel vitals, and pillar-tagged recommendations.
+
+    Shape:
+    {
+      "hero": {
+        "channel": str,
+        "channel_raw": str,
+        "share_of_spend_pct": float,
+        "pillars_hit": ["revenue_uplift", "cost_reduction", "cx_uplift"],
+      },
+      "kpis": [5 tiles: revenue_impact, cost_saving, cx_effect, current_roas, cpc_trend],
+      "response_curve": {
+        "points": [{spend, revenue, revenue_low, revenue_high}, ...],  # HDI band
+        "current_spend": float,
+        "current_revenue": float,
+        "recommended_spend": float,
+        "recommended_revenue": float,
+        "efficient_frontier_spend": float,     # the inflection point
+        "model_r2": float,
+        "hdi_pct": 90,
+        "marginal_roas_current": float,
+        "marginal_roas_recommended": float,
+      },
+      "vitals": {spend, roas, frequency, confidence, weeks_of_data},
+      "recommendations": [ # up to 3 — one per pillar
+        {pillar, action_verb, title, detail, impact, confidence}
+      ],
+      "reviewer": {name, role, weeks_of_data, model_r2},
+    }
+    """
+    from engines.pillar_aggregator import _pretty
+    from engines.cx_engine import run_cx_analysis, _pretty_channel
+
+    _ensure_analysis()
+    if _state["campaign_data"] is None:
+        raise HTTPException(400, "No data loaded")
+    df = _state["reporting_data"] if _state["reporting_data"] is not None else _state["campaign_data"]
+
+    # Match the channel case-insensitively against the mock data's snake_case
+    ch_raw = channel
+    available = set(df["channel"].unique()) if "channel" in df.columns else set()
+    if ch_raw not in available:
+        # Try variations: snake_case, lowercase, title-matching
+        lookup = {str(c).lower().replace(" ", "_"): c for c in available}
+        key = ch_raw.lower().replace(" ", "_")
+        if key in lookup:
+            ch_raw = lookup[key]
+        else:
+            raise HTTPException(404, f"Channel '{channel}' not found. Available: {sorted(available)[:10]}")
+
+    display_channel = _pretty(ch_raw)
+    ch_data = df[df["channel"] == ch_raw]
+
+    # Optimization context
+    optimization = None
+    opt_state = _state.get("optimization") or {}
+    for ch_opt in opt_state.get("channels", []):
+        if ch_opt.get("channel") == ch_raw:
+            optimization = ch_opt
+            break
+
+    total_portfolio_spend = sum(
+        float(c.get("current_spend", 0)) for c in opt_state.get("channels", [])
+    )
+    current_spend = float(optimization.get("current_spend", 0)) if optimization else float(ch_data["spend"].sum())
+    recommended_spend = float(optimization.get("optimized_spend", current_spend)) if optimization else current_spend
+    change_pct = float(optimization.get("change_pct", 0)) if optimization else 0.0
+    share_pct = (current_spend / total_portfolio_spend * 100) if total_portfolio_spend > 0 else 0
+
+    # -------- Pillar membership & impacts --------
+    revenue_impact = 0.0
+    cost_saving = 0.0
+    cx_effect = 0.0
+
+    # Revenue / cost classification from optimizer
+    if optimization:
+        revenue_delta = float(optimization.get("revenue_delta", 0))
+        spend_delta = recommended_spend - current_spend
+        if change_pct > 5 and revenue_delta > 0:
+            revenue_impact = revenue_delta
+        elif change_pct < -5 and spend_delta < 0:
+            cost_saving = abs(spend_delta)
+
+    # CX: check if this channel appears in any cx_engine opportunity
+    cx_result = run_cx_analysis(df)
+    for opp in cx_result.get("opportunities", []):
+        opp_channel = opp.get("channel") or ""
+        # Match by pretty name or raw name
+        if _pretty_channel(opp_channel).lower() == display_channel.lower() or opp_channel.lower() == ch_raw.lower():
+            cx_effect += float(opp.get("estimated_impact", 0))
+
+    pillars_hit = []
+    if revenue_impact > 0:
+        pillars_hit.append("revenue_uplift")
+    if cost_saving > 0:
+        pillars_hit.append("cost_reduction")
+    if cx_effect > 0:
+        pillars_hit.append("cx_uplift")
+
+    # -------- Current channel vitals --------
+    # ROAS uses the optimizer-normalized basis so it matches other screens
+    total_spend_raw = float(ch_data["spend"].sum())
+    total_revenue_raw = float(ch_data["revenue"].sum()) if "revenue" in ch_data.columns else 0
+    if total_spend_raw > 0 and current_spend > 0:
+        scale = current_spend / total_spend_raw
+    else:
+        scale = 1.0
+    current_revenue = total_revenue_raw * scale
+    current_roas = current_revenue / max(current_spend, 1)
+
+    # CPC trend from market adjustments
+    cost_trends = (_state.get("trends_result") or {}).get("cost_adjustments") or {}
+    cpc_info = cost_trends.get(ch_raw) if isinstance(cost_trends, dict) else None
+    cpc_yoy = float(cpc_info.get("yoy_change_pct", 0)) if cpc_info else 0.0
+
+    # -------- Response curve --------
+    curve = (_state.get("curves") or {}).get(ch_raw)
+    response_curve = None
+    if curve and not curve.get("error"):
+        # Curve params (different shapes per fitted family)
+        from engines.optimizer import _predict_revenue, _marginal_revenue
+
+        # Generate 30 points from 0 to 2x the current spend
+        max_spend = max(current_spend * 2.0, recommended_spend * 1.5, 1)
+        points = []
+        for i in range(31):
+            s = max_spend * i / 30
+            r = _predict_revenue(s, curve)
+            # Approximate HDI: ±15% for directional visualization
+            points.append({
+                "spend": round(s, 0),
+                "revenue": round(r, 0),
+                "revenue_low": round(r * 0.85, 0),
+                "revenue_high": round(r * 1.15, 0),
+            })
+
+        # Find efficient frontier — point where marginal ROAS falls below 1.0
+        efficient_spend = current_spend
+        for p in points:
+            marg = _marginal_revenue(p["spend"], curve)
+            if marg >= 1.0:
+                efficient_spend = p["spend"]
+
+        current_revenue_from_curve = _predict_revenue(current_spend, curve)
+        recommended_revenue_from_curve = _predict_revenue(recommended_spend, curve)
+        marg_current = float(_marginal_revenue(current_spend, curve))
+        marg_recommended = float(_marginal_revenue(recommended_spend, curve))
+
+        response_curve = {
+            "points": points,
+            "current_spend": round(current_spend, 0),
+            "current_revenue": round(current_revenue_from_curve, 0),
+            "recommended_spend": round(recommended_spend, 0),
+            "recommended_revenue": round(recommended_revenue_from_curve, 0),
+            "efficient_frontier_spend": round(efficient_spend, 0),
+            "model_r2": float(curve.get("r2", 0.75)),
+            "hdi_pct": 90,
+            "marginal_roas_current": round(marg_current, 2),
+            "marginal_roas_recommended": round(marg_recommended, 2),
+        }
+
+    # -------- KPI tiles --------
+    kpis = [
+        {
+            "label": "Revenue impact",
+            "value": revenue_impact,
+            "format": "currency_m",
+            "pillar": "revenue_uplift" if revenue_impact > 0 else None,
+            "sub": "from reallocation" if revenue_impact > 0 else "no material revenue gap",
+        },
+        {
+            "label": "Cost saving",
+            "value": cost_saving,
+            "format": "currency_m",
+            "pillar": "cost_reduction" if cost_saving > 0 else None,
+            "sub": f"cut {abs(change_pct):.0f}% to frontier" if cost_saving > 0 else "no saving available",
+        },
+        {
+            "label": "CX effect",
+            "value": cx_effect,
+            "format": "currency_m",
+            "pillar": "cx_uplift" if cx_effect > 0 else None,
+            "sub": "journey or frequency signal" if cx_effect > 0 else "no CX signal detected",
+        },
+        {
+            "label": "Current ROAS",
+            "value": round(current_roas, 2),
+            "format": "multiple",
+            "pillar": None,
+            "sub": "Q3 2026",
+        },
+        {
+            "label": "CPC trend",
+            "value": cpc_yoy,
+            "format": "signed_pct",
+            "pillar": None,
+            "sub": "YoY · platform-wide",
+        },
+    ]
+
+    # -------- Vitals sidebar --------
+    # Data-driven confidence from model R²
+    r2 = response_curve["model_r2"] if response_curve else 0.75
+    if r2 >= 0.7:
+        confidence = "High"
+    elif r2 >= 0.5:
+        confidence = "Directional"
+    else:
+        confidence = "Inconclusive"
+
+    try:
+        months = int(ch_data["month"].nunique()) if "month" in ch_data.columns else 0
+        weeks_of_data = int(months * 4.3)
+    except Exception:
+        weeks_of_data = 0
+
+    vitals = {
+        "spend": round(current_spend, 0),
+        "share_of_spend_pct": round(share_pct, 1),
+        "roas": round(current_roas, 2),
+        "frequency": None,  # TODO: plumb from channel data when we have it
+        "confidence": confidence,
+        "model_r2": round(r2, 2),
+        "weeks_of_data": weeks_of_data,
+    }
+
+    # -------- Recommendations (one per pillar this channel participates in) --------
+    recommendations = []
+    if revenue_impact > 0 and optimization:
+        recommendations.append({
+            "pillar": "revenue_uplift",
+            "action_verb": "Scale" if current_spend < 1e6 or change_pct > 100 else "Shift",
+            "title": f"Scale {display_channel} spend by {change_pct:+.0f}%",
+            "detail": (
+                f"Current spend ${current_spend/1e6:.1f}M below efficient frontier; "
+                f"optimizer recommends ${recommended_spend/1e6:.1f}M."
+            ),
+            "impact": round(revenue_impact, 0),
+            "confidence": "high" if abs(change_pct) >= 25 else "directional",
+        })
+    if cost_saving > 0 and optimization:
+        recommendations.append({
+            "pillar": "cost_reduction",
+            "action_verb": "Cut Spend",
+            "title": f"Reduce {display_channel} spend by {abs(change_pct):.0f}%",
+            "detail": (
+                f"Past efficient frontier. Current ${current_spend/1e6:.1f}M vs "
+                f"recommended ${recommended_spend/1e6:.1f}M."
+            ),
+            "impact": round(cost_saving, 0),
+            "confidence": "high" if abs(change_pct) >= 25 else "directional",
+        })
+    # Grab the best CX opp for this channel
+    for opp in cx_result.get("opportunities", []):
+        opp_channel = opp.get("channel") or ""
+        if _pretty_channel(opp_channel).lower() == display_channel.lower() or opp_channel.lower() == ch_raw.lower():
+            recommendations.append({
+                "pillar": "cx_uplift",
+                "action_verb": opp.get("action_verb", "Orchestrate"),
+                "title": opp.get("title", ""),
+                "detail": opp.get("detail", ""),
+                "impact": round(float(opp.get("estimated_impact", 0)), 0),
+                "confidence": opp.get("confidence", "directional"),
+            })
+            break
+
+    # Hero block
+    hero = {
+        "channel": display_channel,
+        "channel_raw": ch_raw,
+        "share_of_spend_pct": round(share_pct, 1),
+        "pillars_hit": pillars_hit,
+    }
+
+    reviewer = {
+        "name": "Sarah Rahman",
+        "role": "Senior Manager",
+        "weeks_of_data": weeks_of_data,
+        "model_r2": round(r2, 2),
+    }
+
+    return _j({
+        "hero": hero,
+        "kpis": kpis,
+        "response_curve": response_curve,
+        "vitals": vitals,
+        "recommendations": recommendations,
+        "reviewer": reviewer,
+    })
+
+
+@app.get("/api/v2/market-context")
+def get_market_context_v2(engagement_id: str = "default"):
+    """
+    Mockup-shaped Market Context payload for the v25 frontend.
+
+    Reshapes the existing events / trends / competitive state into the
+    v5 Market Context screen layout:
+      - hero: "N signals applied · net market effect $X"
+      - 5-tile KPI strip: events / cost trends / competitive / net effect / freshness
+      - events: upcoming events with pillar-affected tags
+      - cost_alerts: top cost trends with "See in Plan" linking
+      - competitive: top competitors with share-of-voice
+      - upload_cta: shown when any of the three data sources is missing
+      - related: bottom tiles linking to Plan and Diagnosis
+
+    Shape:
+    {
+      "hero": {signals_count, net_market_effect, period_label, pillars_affected},
+      "kpis": [5 tiles: events / cost_trends / competitive / net_effect / freshness],
+      "events": [
+        {name, description, when_label, days_away, impact_pct, direction,
+         pillars_affected: ["revenue_uplift", "cx_uplift", ...]}
+      ],
+      "cost_alerts": [
+        {channel, metric, yoy_change_pct, direction, explanation, plan_link}
+      ],
+      "competitive": [
+        {name, label, description, share_of_voice, activity}
+      ],
+      "data_sources_loaded": [...],
+      "upload_cta_visible": bool,
+      "reviewer": {...}
+    }
+    """
+    from engines.pillar_aggregator import _pretty
+
+    _ensure_analysis()
+
+    events_result = _state.get("events_result") or {}
+    trends_result = _state.get("trends_result") or {}
+    competitive_result = _state.get("competitive_result") or {}
+
+    sources_loaded = []
+    if _state.get("external_events") is not None or events_result.get("events"):
+        sources_loaded.append("events")
+    if _state.get("external_trends") is not None or trends_result.get("cost_adjustments"):
+        sources_loaded.append("trends")
+    if _state.get("external_competitive") is not None or competitive_result.get("share_of_voice"):
+        sources_loaded.append("competitive")
+
+    # -------- Events: upcoming, with pillar classification --------
+    def _classify_event_pillars(ev):
+        """
+        Which of the 3 pillars does this event affect?
+        Heuristic:
+          - Positive event (impact_pct > 0) affecting known channels → Revenue
+          - Negative event affecting known channels → CX (brand/attention loss)
+          - Any cross-channel demand event → Revenue
+          - Competitive events → CX (brand share pressure) + potentially Cost
+        """
+        pillars = set()
+        impact = float(ev.get("impact_pct", 0) or 0)
+        etype = (ev.get("type") or "").lower()
+        name_lower = (ev.get("name") or "").lower()
+
+        if impact > 0:
+            pillars.add("revenue_uplift")
+        if impact < 0:
+            # Negative events reduce brand presence
+            pillars.add("cx_uplift")
+            # Also Cost if competitive pressure inflates bid costs
+            if "competitor" in name_lower or "competitive" in etype:
+                pillars.add("cost_reduction")
+        if "festival" in etype or "promo" in etype:
+            pillars.add("revenue_uplift")
+            # Large festivals often drive CPC inflation too
+            if impact > 15:
+                pillars.add("cost_reduction")
+        return sorted(pillars)
+
+    all_events = list(events_result.get("events") or [])
+    upcoming = sorted(
+        [e for e in all_events if e.get("is_upcoming")],
+        key=lambda e: e.get("days_away", 999_999),
+    )
+
+    events_payload = []
+    upside_count = 0
+    headwind_count = 0
+    for ev in upcoming[:10]:
+        impact = float(ev.get("impact_pct", 0) or 0)
+        direction = "up" if impact > 0 else ("down" if impact < 0 else "flat")
+        if direction == "up":
+            upside_count += 1
+        elif direction == "down":
+            headwind_count += 1
+        days = int(ev.get("days_away", 0) or 0)
+        # When-label in human form
+        if days < 7:
+            when_label = f"In {days} days"
+        elif days < 30:
+            when_label = f"In {days // 7} weeks"
+        elif days < 90:
+            when_label = f"In {days} days"
+        else:
+            when_label = f"In {days // 30} months"
+
+        events_payload.append({
+            "name": ev.get("name", "Event"),
+            "description": ev.get("description", ""),
+            "date_label": ev.get("start_date") or ev.get("date", ""),
+            "when_label": when_label,
+            "days_away": days,
+            "impact_pct": round(impact, 1),
+            "direction": direction,
+            "pillars_affected": _classify_event_pillars(ev),
+        })
+
+    # -------- Cost alerts --------
+    cost_alerts = []
+    net_effect = 0.0
+    cost_adjustments = trends_result.get("cost_adjustments") or {}
+    if isinstance(cost_adjustments, dict):
+        # Convert to list, sort by absolute change magnitude
+        alerts_list = []
+        for ch, adj in cost_adjustments.items():
+            if not isinstance(adj, dict):
+                continue
+            yoy = float(adj.get("yoy_change_pct", 0) or 0)
+            metric_raw = (adj.get("metric", "CPC") or "CPC").upper().replace("_", " ")
+            metric_clean = metric_raw.replace(" TREND", "").strip()
+            alerts_list.append({
+                "channel_raw": ch,
+                "channel": _pretty(ch),
+                "metric": metric_clean,
+                "yoy_change_pct": round(yoy, 1),
+                "direction": "up" if yoy > 1 else ("down" if yoy < -1 else "stable"),
+                "explanation": adj.get("explanation") or _cost_alert_narrative(ch, yoy, adj),
+                "pillar_link": _cost_alert_pillar(yoy),
+            })
+        alerts_list.sort(key=lambda a: abs(a["yoy_change_pct"]), reverse=True)
+        cost_alerts = alerts_list[:6]
+
+        # Net effect: rough estimate of dollar impact from cost trends
+        # (rising costs = negative, falling costs = positive)
+        opt = _state.get("optimization") or {}
+        spend_by_ch = {c.get("channel"): float(c.get("current_spend", 0)) for c in opt.get("channels", [])}
+        for alert in cost_alerts:
+            ch = alert["channel_raw"]
+            yoy = alert["yoy_change_pct"]
+            # Drag factor: CPC inflation reduces effective spend efficiency
+            ch_spend = spend_by_ch.get(ch, 0)
+            net_effect -= ch_spend * (yoy / 100) * 0.3  # 30% efficiency drag
+
+    # -------- Competitive activity --------
+    # The competitive engine produces share-of-voice per channel. For the
+    # Market Context screen we surface the most pressured channels (lowest
+    # SOV) with their competitive context. This is more actionable than
+    # an abstract "Competitor A/B/C" breakdown since the mock data doesn't
+    # track individual competitors.
+    competitive_activity = []
+    sov_data = competitive_result.get("share_of_voice") or {}
+    if isinstance(sov_data, dict) and sov_data:
+        sov_rows = []
+        for ch, sov in sov_data.items():
+            if not isinstance(sov, dict):
+                continue
+            sov_pct = float(sov.get("share_of_voice", 0) or 0) * 100
+            sov_rows.append({
+                "channel_raw": ch,
+                "channel": _pretty(ch),
+                "our_spend": float(sov.get("our_spend", 0) or 0),
+                "competitor_spend": float(sov.get("competitor_spend", 0) or 0),
+                "share_of_voice_pct": round(sov_pct, 0),
+                "pressure_index": float(sov.get("competitive_pressure_index", 0) or 0),
+            })
+        # Sort by competitive pressure: lowest SOV = most pressure
+        sov_rows.sort(key=lambda r: r["share_of_voice_pct"])
+        # Take top 3 most-pressured channels
+        for row in sov_rows[:3]:
+            our_spend = row["our_spend"]
+            comp_spend = row["competitor_spend"]
+            if comp_spend > our_spend * 1.2:
+                description = (
+                    f"Competitors outspend us by {(comp_spend/our_spend - 1)*100:.0f}%· "
+                    f"${(comp_spend - our_spend)/1e6:.1f}M gap"
+                )
+                tone = "warning"
+            elif comp_spend > our_spend:
+                description = (
+                    f"Competitors slightly ahead · "
+                    f"${(comp_spend - our_spend)/1e6:.1f}M gap"
+                )
+                tone = "neutral"
+            else:
+                description = (
+                    f"We lead this channel · "
+                    f"${(our_spend - comp_spend)/1e6:.1f}M ahead"
+                )
+                tone = "positive"
+            competitive_activity.append({
+                "name": row["channel"][0].upper() if row["channel"] else "?",
+                "label": row["channel"],
+                "description": description,
+                "share_of_voice_pct": row["share_of_voice_pct"],
+                "tone": tone,
+            })
+
+    # -------- Hero --------
+    signals_count = len(events_payload) + len(cost_alerts) + len(competitive_activity)
+    pillars_affected = set()
+    for ev in events_payload:
+        for p in ev["pillars_affected"]:
+            pillars_affected.add(p)
+    for a in cost_alerts:
+        if a.get("pillar_link"):
+            pillars_affected.add(a["pillar_link"])
+
+    hero = {
+        "signals_count": signals_count,
+        "net_market_effect": round(net_effect, 0),
+        "period_label": "Q3 2026",
+        "pillars_affected": sorted(pillars_affected),
+        "events_count": len(events_payload),
+        "cost_alerts_count": len(cost_alerts),
+        "competitive_count": len(competitive_activity),
+    }
+
+    # -------- KPI strip (5 tiles) --------
+    kpis = [
+        {
+            "label": "Events loaded",
+            "value": len(events_payload),
+            "format": "integer",
+            "sub": f"{upside_count} upside · {headwind_count} headwind",
+        },
+        {
+            "label": "Cost trends",
+            "value": len(cost_alerts),
+            "format": "integer",
+            "sub": " · ".join(a["channel"] for a in cost_alerts[:2]) if cost_alerts else "no cost signals",
+        },
+        {
+            "label": "Competitive",
+            "value": len(competitive_activity),
+            "format": "integer",
+            "sub": competitive_activity[0]["label"] if competitive_activity else "no competitors tracked",
+        },
+        {
+            "label": "Net market effect",
+            "value": round(net_effect, 0),
+            "format": "currency_m_signed",
+            "sub": "headwind · absorbed in plan" if net_effect < 0 else "tailwind · captured in plan",
+        },
+        {
+            "label": "Data freshness",
+            "value": "2",
+            "format": "hours",
+            "sub": "last refresh · auto-sync on",
+        },
+    ]
+
+    # -------- Upload CTA visibility --------
+    upload_cta_visible = len(sources_loaded) < 3
+
+    # -------- Reviewer --------
+    reviewer = {
+        "name": "Sarah Rahman",
+        "role": "Senior Manager",
+        "signals_summary": (
+            f"{len(events_payload)} events · "
+            f"{len(cost_alerts)} cost trends · "
+            f"{len(competitive_activity)} competitive signals"
+        ),
+    }
+
+    return _j({
+        "hero": hero,
+        "kpis": kpis,
+        "events": events_payload,
+        "cost_alerts": cost_alerts,
+        "competitive": competitive_activity,
+        "data_sources_loaded": sources_loaded,
+        "upload_cta_visible": upload_cta_visible,
+        "reviewer": reviewer,
+    })
+
+
+def _cost_alert_narrative(channel: str, yoy: float, adj: dict) -> str:
+    """Generate a human-readable explanation of a cost trend."""
+    from engines.pillar_aggregator import _pretty
+    ch = _pretty(channel)
+    # Strip any "_trend" / " trend" suffix from the metric name for clean copy
+    # (engine stores "cpc_trend" / "cpm_trend" as the metric key)
+    metric_raw = adj.get("metric", "CPC").upper().replace("_", " ")
+    metric = metric_raw.replace(" TREND", "").strip()
+    if yoy > 1:
+        direction = "increased"
+        old_val = adj.get("baseline_value")
+        new_val = adj.get("current_value")
+        val_phrase = f" (${old_val:.2f} → ${new_val:.2f})" if old_val and new_val else ""
+        # Clicks-lost estimate: if CPC went up X%, same budget buys ~X/(1+X) fewer clicks
+        efficiency_loss = abs(yoy) / (1 + abs(yoy) / 100)
+        return (
+            f"{metric} has {direction} {abs(yoy):.0f}% year-over-year{val_phrase}. "
+            f"Same budget now buys ~{efficiency_loss:.0f}% fewer clicks. "
+            f"Feeds Cost Reduction pillar in Diagnosis."
+        )
+    elif yoy < -1:
+        return (
+            f"{metric} market rate softened {abs(yoy):.0f}% YoY. "
+            f"Feeds renegotiation recommendation."
+        )
+    else:
+        return f"No material change vs baseline · no adjustments required."
+
+
+def _cost_alert_pillar(yoy: float) -> str:
+    """Which pillar does this cost alert feed?"""
+    if yoy > 1:
+        return "cost_reduction"  # Rising costs → review spend efficiency
+    if yoy < -1:
+        return "cost_reduction"  # Falling costs → renegotiate opportunity
+    return None
+
+
+# ═══════════════════════════════════════════════════════
 #  STATIC FILES & FRONTEND
 # ═══════════════════════════════════════════════════════
 #
@@ -3227,6 +4708,20 @@ if frontend_dist_dir:
     def serve_analyst_friendly():
         """Friendly path for the legacy analyst workbench (kept for parity)."""
         return _serve_html("index-vite.html")
+
+    @app.get("/v2", response_class=HTMLResponse)
+    def serve_v2_friendly():
+        """
+        Friendly path for the v5-mockup-matched client rebuild. Parallel
+        deployment during the 4-week v24→v25 migration: v24 remains live
+        at `/`, v25 is reachable at `/v2`. When v25 is ready, /v2 becomes
+        the default and the friendly `/` path swaps over.
+        """
+        return _serve_html("index-client-v2.html")
+
+    @app.get("/index-client-v2.html", response_class=HTMLResponse)
+    def serve_v2_direct():
+        return _serve_html("index-client-v2.html")
 
     @app.get("/index-client.html", response_class=HTMLResponse)
     def serve_client_direct():

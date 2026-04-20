@@ -278,7 +278,19 @@ export function Plan({
  * for market changes to be visible on Plan, so hiding them behind a
  * disclosure would miss the point.
  */
-function MarketOverlay({ data, editorMode, onToggle }) {
+/**
+ * MarketOverlay — shared component used by Plan AND Scenarios screens.
+ * Exported so Scenarios can render its own scenario-specific overlay
+ * without duplicating the 170+ lines of component + styling.
+ *
+ * Props:
+ *   data: the /market-adjustments or /market-adjustments/scenario payload
+ *   editorMode: show toggle switches on adjustments
+ *   onToggle: (adjustmentId, newApplied) => Promise — editor toggle handler
+ *   title: override the "PLAN · MARKET OVERLAY" eyebrow. Pass
+ *          "SCENARIOS · MARKET OVERLAY" etc.
+ */
+export function MarketOverlay({ data, editorMode, onToggle, title }) {
   const { adjustments = [], summary = {}, baseline_total_revenue_delta = 0, adjusted_total_revenue_delta = 0 } = data;
   const [expanded, setExpanded] = useState(true);
 
@@ -300,7 +312,7 @@ function MarketOverlay({ data, editorMode, onToggle }) {
       <OverlayHead>
         <OverlayEyebrow>
           <EyebrowDot />
-          PLAN · MARKET OVERLAY
+          {title || "PLAN · MARKET OVERLAY"}
         </OverlayEyebrow>
         <OverlayHeadlineRow>
           <OverlayHeadline>

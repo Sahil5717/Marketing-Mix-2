@@ -4,10 +4,13 @@ import { t } from "../tokens.js";
 import {
   fetchScenarioPresets,
   fetchScenario,
+  fetchScenarioMarketAdjustments,
+  overrideMarketAdjustment,
 } from "../api.js";
 import { Callout } from "../ui/Callout.jsx";
 import { MoveCard } from "../ui/MoveCard.jsx";
 import { TwoColumn, MainColumn, Sidebar } from "../ui/PageShell.jsx";
+import { MarketOverlay } from "./Plan.jsx";
 
 /**
  * Scenarios — redesigned per UX handoff + mockup Image 4.
@@ -56,6 +59,10 @@ export function Scenarios({ data: initialData, view = "client" }) {
   const [customBudget, setCustomBudget] = useState("");
   const [loading, setLoading] = useState(false);
   const [runError, setRunError] = useState(null);
+  // Market adjustments for the currently-displayed scenario. Recomputed
+  // whenever the scenario's total_budget changes (preset change or
+  // custom budget run). null = loading or not-yet-fetched.
+  const [marketAdj, setMarketAdj] = useState(null);
 
   // Load presets once on mount
   useEffect(() => {
@@ -82,12 +89,51 @@ export function Scenarios({ data: initialData, view = "client" }) {
     if (d) {
       setData(d);
       setActivePreset(presetKey || "custom");
+      // Also fetch market adjustments for this specific scenario budget.
+      // Non-blocking — UI can render the comparison without waiting.
+      setMarketAdj(null);  // clear stale view
+      fetchScenarioMarketAdjustments({ totalBudget }).then(({ data: m }) => {
+        if (m) setMarketAdj(m);
+      });
     } else if (error) {
       setRunError(
         error.message || "Failed to run scenario. Check connection and try again."
       );
     }
   }, [view]);
+
+  // Load market adjustments for the initial scenario on mount.
+  useEffect(() => {
+    if (!data) return;
+    const budget = data?.scenario?.total_budget;
+    if (budget == null) return;
+    fetchScenarioMarketAdjustments({ totalBudget: budget }).then(({ data: m }) => {
+      if (m) setMarketAdj(m);
+    });
+    // Run once on mount; subsequent changes handled by runScenario.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Handler for analyst override toggle — same optimistic update pattern
+  // Plan uses. Updates in-memory state immediately, fires server sync.
+  const handleAdjustmentToggle = useCallback(async (adjustmentId, newApplied) => {
+    setMarketAdj((prev) => {
+      if (!prev) return prev;
+      const adjustments = prev.adjustments.map((a) =>
+        a.id === adjustmentId ? { ...a, applied: newApplied } : a
+      );
+      const net_delta = adjustments
+        .filter((a) => a.applied)
+        .reduce((s, a) => s + (a.revenue_delta || 0), 0);
+      return {
+        ...prev,
+        adjustments,
+        adjusted_total_revenue_delta: prev.baseline_total_revenue_delta + net_delta,
+        summary: { ...prev.summary, net_delta },
+      };
+    });
+    await overrideMarketAdjustment(adjustmentId, newApplied);
+  }, []);
 
   const handlePresetClick = useCallback((preset) => {
     runScenario({
@@ -204,6 +250,23 @@ export function Scenarios({ data: initialData, view = "client" }) {
                 {moves.length > 0 ? ` · ${moves.length} channels affected` : ""}
               </AllocationMeta>
             </AllocationHead>
+
+            {/* Market overlay — scenario-specific adjustments layered on top
+                of the scenario's moves. Only visible when external data is
+                loaded AND the scenario actually produced moves (i.e. not
+                baseline). Hidden cleanly when the scenario is the
+                do-nothing baseline since there's nothing to adjust. */}
+            {marketAdj &&
+              marketAdj.summary?.has_market_data &&
+              marketAdj.adjustments?.length > 0 &&
+              moves.length > 0 && (
+                <MarketOverlay
+                  data={marketAdj}
+                  editorMode={view === "editor"}
+                  onToggle={handleAdjustmentToggle}
+                  title="SCENARIOS · MARKET OVERLAY"
+                />
+              )}
 
             {moves.length === 0 && (
               <EmptyState>
