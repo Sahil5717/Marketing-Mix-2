@@ -22,7 +22,6 @@ export function AppHeader({
   currentScreen = "diagnosis",
   auth,
   editorMode = false,
-  v2Mode = false,           // NEW: when true, Brand links to /v2 and NavItems use SPA routing
   engagementMeta,
   bayesStatus,       // { state, message, elapsed_s, r_hat_max, ess_min } — editor mode only
   onBayesRefresh,    // callback to trigger /api/bayes-refit
@@ -33,23 +32,23 @@ export function AppHeader({
     <HeaderBar $editor={editorMode}>
       <Inner $editor={editorMode}>
         <BrandNav>
-          <Brand href={editorMode ? "/editor" : v2Mode ? "/v2" : "/"}>
+          <Brand href={editorMode ? "/editor" : "/"}>
             <BrandMark>M</BrandMark>
             <BrandWord>MarketLens</BrandWord>
           </Brand>
 
           <Nav>
             {editorMode && (
-              <NavItem screen="engagements" current={currentScreen} label="Engagements" v2Mode={v2Mode} />
+              <NavItem screen="engagements" current={currentScreen} label="Engagements" />
             )}
             {editorMode && (
-              <NavItem screen="hub" current={currentScreen} label="Workspace" v2Mode={v2Mode} />
+              <NavItem screen="hub" current={currentScreen} label="Workspace" />
             )}
-            <NavItem screen="diagnosis" current={currentScreen} label="Diagnosis" v2Mode={v2Mode} />
-            <NavItem screen="plan" current={currentScreen} label="Plan" v2Mode={v2Mode} />
-            <NavItem screen="scenarios" current={currentScreen} label="Scenarios" v2Mode={v2Mode} />
-            <NavItem screen="channels" current={currentScreen} label="Channels" v2Mode={v2Mode} />
-            <NavItem screen="market" current={currentScreen} label="Market" v2Mode={v2Mode} />
+            <NavItem screen="diagnosis" current={currentScreen} label="Diagnosis" />
+            <NavItem screen="plan" current={currentScreen} label="Plan" />
+            <NavItem screen="scenarios" current={currentScreen} label="Scenarios" />
+            <NavItem screen="channels" current={currentScreen} label="Channels" />
+            <NavItem screen="market" current={currentScreen} label="Market" />
           </Nav>
         </BrandNav>
 
@@ -79,34 +78,10 @@ export function AppHeader({
   );
 }
 
-function NavItem({ screen, current, label, v2Mode = false }) {
+function NavItem({ screen, current, label }) {
   const isActive = current === screen;
-
-  // In v2 mode, intercept the click to do SPA routing via pushState + popstate.
-  // This preserves the React tree instead of hard-reloading, which is what the
-  // main-client-v2.jsx navigate() does internally. Without this, clicking a
-  // nav tab triggers a full browser navigation — works, but slower and loses
-  // any in-memory state in screens that persist data.
-  //
-  // In v24 mode (the default), the href behavior is preserved unchanged so
-  // the editor's multi-page navigation still works as it always did.
-  function handleClick(e) {
-    if (!v2Mode) return;  // v24: let the browser handle the href normally
-    e.preventDefault();
-    const url = new URL(window.location.href);
-    url.searchParams.set("screen", screen);
-    // Clear stale param on tab changes — don't let a ?ch=paid_search from the
-    // channel tab persist into Plan or Diagnosis.
-    if (screen !== "channels" && screen !== "channel") {
-      url.searchParams.delete("ch");
-      url.searchParams.delete("channel");
-    }
-    window.history.pushState({}, "", url);
-    window.dispatchEvent(new PopStateEvent("popstate"));
-  }
-
   return (
-    <NavLink href={`?screen=${screen}`} $active={isActive} onClick={handleClick}>
+    <NavLink href={`?screen=${screen}`} $active={isActive}>
       {label}
     </NavLink>
   );

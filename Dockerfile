@@ -56,17 +56,11 @@ WORKDIR /app/frontend
 RUN npm run build
 
 # Verify the build produced what we expect. Fail fast at build time if
-# any of the entry points are missing. The v2 entry (index-client-v2.html)
-# is the v25 redesigned client; if it's missing, /v2 will 404 at runtime
-# even though /, /editor, /login all work.
-RUN test -f /app/frontend-dist/index-client.html || (echo "Missing v1 client HTML" && exit 1)
-RUN test -f /app/frontend-dist/index-client-v2.html || (echo "Missing v2 client HTML" && exit 1)
+# any of the four entry points are missing.
+RUN test -f /app/frontend-dist/index-client.html || (echo "Missing client HTML" && exit 1)
 RUN test -f /app/frontend-dist/index-editor.html || (echo "Missing editor HTML" && exit 1)
 RUN test -f /app/frontend-dist/index-login.html || (echo "Missing login HTML" && exit 1)
 RUN test -d /app/frontend-dist/assets || (echo "Missing assets dir" && exit 1)
-# Sanity-check the v2 client bundle is actually present (name has a hash suffix)
-RUN ls /app/frontend-dist/assets/clientV2-*.js > /dev/null 2>&1 \
-    || (echo "Missing clientV2 bundle — check vite.config.js rollup inputs" && exit 1)
 RUN echo "[OK] Frontend built successfully:" && ls -la /app/frontend-dist/
 
 WORKDIR /app/backend

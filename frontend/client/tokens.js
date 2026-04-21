@@ -63,25 +63,6 @@ export const tokens = {
     // Dark surface — for the primary KPI card's inverted treatment
     dark: "#1A1815",
     darkSurface: "#24211D",   // slightly lighter for nested dark elements
-
-    // ─── v5 pillar colors (mockup-matched) ────
-    // Used by DiagnosisV2, Plan v2, Scenarios v2, ChannelDetail v2.
-    // Each pillar has a deep solid (for action chips and accents) and a soft
-    // tint (for pillar-pills, confidence chips, and subtle card-tops).
-    pillarRev: "#2D6A4F",        // Revenue Uplift — forest green
-    pillarRevSoft: "#E1EEE6",    // tint for pill backgrounds
-    pillarCost: "#C8863A",       // Cost Reduction — amber (matches accent family)
-    pillarCostSoft: "#F5E8D0",
-    pillarCx: "#2F5D7F",         // CX Uplift — slate blue
-    pillarCxSoft: "#DCE8F2",
-  },
-
-  // ─── v5 typography additions ────
-  // Libre Caslon replaces Instrument Serif for headlines in v5 screens.
-  // Font loaded via Google Fonts in index-client-v2.html and DiagnosisV2.
-  fontV2: {
-    headline: "'Libre Caslon Text', 'Instrument Serif', Georgia, serif",
-    body: "'Source Sans Pro', 'Geist', system-ui, -apple-system, sans-serif",
   },
 
   // ─── Typography ───

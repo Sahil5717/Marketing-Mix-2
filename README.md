@@ -20,17 +20,6 @@ Designed for **consulting analysts** preparing marketing effectiveness deliverab
 - **Editor mode** (`/editor`) — for the analyst: data uploads, engagement management, suppressions, custom commentary, model diagnostics
 - **Client mode** (`/`) — for the CXO: the polished read-out, with the analyst's edits applied
 
-### v25 client redesign — parallel deployment at `/v2`
-
-The v25 client is a mockup-matched redesign shipped alongside v24 during the 4-week migration. Live at `/v2` (login at `/v2/login`). Same backend, same data, new surface:
-
-- **Three-pillar value framework** — every opportunity classified as Revenue Uplift, Cost Reduction, or CX Uplift
-- **Six screens**: Login · Diagnosis · Plan · Scenarios · Channel Detail · Market Context
-- **Endpoints**: `/api/v2/diagnosis` · `/api/v2/plan` · `/api/v2/scenarios` · `/api/v2/channel/{ch}` · `/api/v2/market-context`
-- **Libre Caslon Text + Source Sans Pro** typography via Google Fonts; ivory canvas (#FAF7F2) with pillar-specific accent colors (forest green / amber / slate)
-- **Bayesian credible intervals surfaced on the response curve chart** (HDI band rendered inline as SVG)
-- **v24 remains fully functional** at `/` and `/editor` during the transition — tested with regression guards in `test_v2_cross_nav.py`
-
 ## Architecture
 
 - **Backend**: FastAPI (Python 3.12)

@@ -23,10 +23,6 @@ export default defineConfig({
         analyst: resolve(__dirname, 'index-vite.html'),
         // The MarketLens client app — client-facing Diagnosis surface
         client: resolve(__dirname, 'index-client.html'),
-        // v2 client app (v5 mockup-matched rebuild) — parallel deployment
-        // during the 4-week migration. Live on /v2 via backend routing
-        // or index-client-v2.html directly.
-        clientV2: resolve(__dirname, 'index-client-v2.html'),
         // The EY editor — curation overlay on the same Diagnosis surface
         editor: resolve(__dirname, 'index-editor.html'),
         // Login page — entry point before client/editor apps load
